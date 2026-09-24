@@ -347,6 +347,10 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
                 canonical = canonical_sqlite_path(target)
                 if (" (deleted)" in target and canonical in watched
                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                    if pid == os.getpid():
+                        from hermes_state_lockguard import _is_fallback_fd_path
+                        if _is_fallback_fd_path(fd_path):
+                            continue
                     holders.append((pid, target))
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)

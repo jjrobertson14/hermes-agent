@@ -1172,9 +1172,37 @@ class SessionDB(
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
-            return any(
-                _stat_db_file_identity(Path(base + suffix)) != ident for suffix, ident in recorded.items()
-            )
+            current = _stat_sqlite_sidecar_identity(self.db_path)
+            changed = {
+                suffix: ident for suffix, ident in recorded.items()
+                if current.get(suffix) != ident
+            }
+            if not changed:
+                return False
+            # A named SHM may be renamed while this connection still owns the old, linked mapping.
+            # Restore that mapping's name before another write: continuing against a newly-created
+            # SHM makes its index diverge from this connection's WAL view. WAL changes, missing
+            # sidecars, deleted old mappings, and non-/proc platforms stay fail-closed.
+            if set(changed) == {"-shm"} and current.get("-shm") is not None and sys.platform.startswith("linux"):
+                old_identity = changed["-shm"]
+                try:
+                    # The replacement has no SQLite descriptor yet. Guard it first; should the
+                    # restore below race a closer, its private OFD descriptor still protects it.
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    old_target = next(
+                        target.removesuffix(" (deleted)")
+                        for target, fd_path in _proc_fd_targets(os.getpid())
+                        for st in [os.stat(fd_path)]
+                        if " (deleted)" not in target
+                        and (st.st_dev, st.st_ino) == old_identity
+                    )
+                    os.replace(old_target, base + "-shm")
+                except (OSError, StopIteration):
+                    return True
+                else:
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    return False
+            return True
         if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
             return False
         if sys.platform.startswith("linux"):
