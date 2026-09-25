@@ -1172,9 +1172,27 @@ class SessionDB(
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
-            return any(
-                _stat_db_file_identity(Path(base + suffix)) != ident for suffix, ident in recorded.items()
-            )
+            current = _stat_sqlite_sidecar_identity(self.db_path)
+            changed = {suffix: ident for suffix, ident in recorded.items() if current.get(suffix) != ident}
+            if not changed:
+                return False
+            if set(changed) == {"-shm"} and current.get("-shm") is not None and sys.platform.startswith("linux"):
+                old_identity = changed["-shm"]
+                try:
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    old_target = next(
+                        target.removesuffix(" (deleted)")
+                        for target, fd_path in _proc_fd_targets(os.getpid())
+                        for st in [os.stat(fd_path)]
+                        if " (deleted)" not in target and (st.st_dev, st.st_ino) == old_identity
+                    )
+                    os.replace(old_target, base + "-shm")
+                except (OSError, StopIteration):
+                    return True
+                else:
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    return False
+            return True
         if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
             return False
         if sys.platform.startswith("linux"):
