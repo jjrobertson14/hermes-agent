@@ -31,6 +31,8 @@ import sys
 import threading
 from typing import Dict, Optional, Set, Tuple
 
+import hermes_state_generation_anchor as _anchor
+
 logger = logging.getLogger("hermes_state")
 
 # SQLite's unix VFS lock geometry (os_unix.c): the SHARED range on the main file and the
@@ -76,8 +78,13 @@ Held = Dict[Identity, Tuple[int, int]]  # inode this handle guards -> its (start
 
 # Handles per guarded inode in this process. Several SessionDB handles on one file share the
 # same descriptors' locks (hold() locks every matching descriptor), so the LAST handle unlocks.
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 _HANDLES: Dict[Identity, int] = {}
+
+# Compatibility seams for lifecycle tests; all private anchor state lives in _anchor.
+_fallback_fd = _anchor.fallback_fd
+_is_fallback_fd = _anchor.is_fallback_fd
+_is_fallback_fd_path = _anchor.is_fallback_fd_path
 
 
 def supported() -> bool:
@@ -151,11 +158,20 @@ def hold(db_path, held: Optional[Held] = None) -> Held:
     ranges = _guard_ranges(db_path)
     try:
         with _LOCK:
+            own_fds: Dict[Identity, list[int]] = {ident: [] for ident in ranges}
             for fd, ident in _own_fds_for(set(ranges)):
-                start, length = ranges[ident]
-                if _ofd_lock(fd, _F_RDLCK, start, length) and ident not in held:
-                    held[ident] = ranges[ident]
-                    _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
+                if not _is_fallback_fd(fd, ident):
+                    own_fds[ident].append(fd)
+            shm_ident = _identity(os.fspath(db_path) + "-shm")
+            for ident, rng in ranges.items():
+                fds = own_fds[ident]
+                if not fds:
+                    fallback = _fallback_fd(ident, os.fspath(db_path) + ("-shm" if ident == shm_ident else ""))
+                    fds = [fallback] if fallback is not None else []
+                for fd in fds:
+                    if _ofd_lock(fd, _F_RDLCK, *rng) and ident not in held:
+                        held[ident] = rng
+                        _HANDLES[ident] = _HANDLES.get(ident, 0) + 1
     except OSError:
         logger.debug("WAL lock guard unavailable for %s", os.fspath(db_path), exc_info=True)
     return held
@@ -181,8 +197,7 @@ def release(held: Held) -> None:
         if not to_unlock:
             return
         try:
-            for fd, ident in _own_fds_for(set(to_unlock)):
-                start, length = to_unlock[ident]
-                _ofd_lock(fd, _F_UNLCK, start, length)
+            for ident, rng in to_unlock.items():
+                _anchor.release_final(ident, rng, _own_fds_for)
         except OSError:
             pass
