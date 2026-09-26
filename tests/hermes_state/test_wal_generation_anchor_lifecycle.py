@@ -76,6 +76,36 @@ def test_recycled_working_fd_for_another_inode_is_not_an_anchor(tmp_path):
             pass
 
 
+def test_final_release_does_not_unlock_recycled_foreign_ofd(tmp_path):
+    """The real descriptor scan must not release a recycled foreign OFD's lock."""
+    path = tmp_path / "state.db"
+    path.touch()
+    stat = path.stat()
+    identity = (stat.st_dev, stat.st_ino)
+    rng = (0x40000002, 510)
+
+    working_fd = anchor.fallback_fd(identity, str(path))
+    assert working_fd is not None
+    foreign_fd = -1
+    try:
+        os.close(working_fd)
+        foreign_fd = os.open(path, os.O_RDWR)
+        if foreign_fd != working_fd:
+            os.dup2(foreign_fd, working_fd)
+            os.close(foreign_fd)
+            foreign_fd = working_fd
+
+        assert lg._ofd_lock(foreign_fd, lg._F_RDLCK, *rng)
+        assert not _foreign_exclusive_ok(str(path))
+
+        anchor.release_final(identity, rng, lg._own_fds_for)
+
+        assert not _foreign_exclusive_ok(str(path)), "final release unlocked the foreign OFD"
+    finally:
+        if foreign_fd >= 0:
+            os.close(foreign_fd)
+
+
 def test_reopened_writer_is_guarded_again(tmp_path, monkeypatch):
     pin_wal(monkeypatch)
     db = make_db(tmp_path / "state.db", "s", "seed")

@@ -125,8 +125,10 @@ def release_final(ident: Identity, rng: tuple[int, int], own_fds_for) -> None:
     with _LOCK:
         record = _FALLBACKS.get(ident)
         verified = _verified_anchor(ident, record) if record else set()
-        if record and verified:
-            guard._ofd_lock(record[0], guard._F_UNLCK, *rng)
+        if record:
+            if verified:
+                guard._ofd_lock(record[0], guard._F_UNLCK, *rng)
+            return
         for fd, found in own_fds_for({ident}):
-            if found == ident and fd not in verified:
+            if found == ident:
                 guard._ofd_lock(fd, guard._F_UNLCK, *rng)
