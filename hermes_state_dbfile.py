@@ -376,6 +376,10 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
                 canonical = canonical_sqlite_path(target)
                 if (" (deleted)" in target and canonical in watched
                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                    if pid == os.getpid():
+                        from hermes_state_generation_anchor import is_fallback_fd_path
+                        if is_fallback_fd_path(fd_path):
+                            continue
                     holders.append((pid, target))
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)
@@ -660,23 +664,29 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     acquired = False
+    unlock: Optional[Callable[[], None]] = None
     try:
+        try_lock: Callable[[], None]
         if platform.system() == "Windows":
             import msvcrt
+            locking = getattr(msvcrt, "locking")
+            nonblocking_lock = getattr(msvcrt, "LK_NBLCK")
+            unlock_lock = getattr(msvcrt, "LK_UNLCK")
+
             def _lock(mode):  # msvcrt locks a byte range from the current position
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), mode, 1)
+                locking(handle.fileno(), mode, 1)
 
-            _try_lock = lambda: _lock(msvcrt.LK_NBLCK)  # noqa: E731
-            _unlock = lambda: _lock(msvcrt.LK_UNLCK)  # noqa: E731
+            try_lock = lambda: _lock(nonblocking_lock)  # noqa: E731
+            unlock = lambda: _lock(unlock_lock)  # noqa: E731
         else:
             import fcntl
-            _try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
-            _unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # noqa: E731
+            try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+            unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # noqa: E731
         deadline = time.monotonic() + timeout
         while not acquired:
             try:
-                _try_lock()
+                try_lock()
                 acquired = True
             except OSError:
                 if time.monotonic() >= deadline:
@@ -686,7 +696,8 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
     finally:
         try:
             if acquired:
-                _unlock()
+                assert unlock is not None  # acquisition only follows a platform-specific lock setup
+                unlock()
         except (OSError, AttributeError):
             pass
         finally:

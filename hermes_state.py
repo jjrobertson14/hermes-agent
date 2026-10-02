@@ -567,7 +567,7 @@ class SessionDB(
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(self, db_path: Optional[Path] = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
         _ensure_test_isolation(self.db_path)  # before any connection/pragma/mkdir
         self.read_only = read_only
@@ -1019,14 +1019,16 @@ class SessionDB(
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    conn = self._conn
+                    assert conn is not None  # _reopen_after_close_locked either opens or raises
+                    conn.execute("BEGIN IMMEDIATE")
                     try:
                         fn_started = True
-                        result = fn(self._conn)
-                        self._conn.commit()
+                        result = fn(conn)
+                        conn.commit()
                     except BaseException:
                         try:
-                            self._conn.rollback()
+                            conn.rollback()
                         except Exception:
                             pass
                         raise
@@ -1151,6 +1153,7 @@ class SessionDB(
                 # writing to): publish structural damage so the list is not read as empty.
                 note_storage_error(self.db_path, exc)
                 raise
+        raise RuntimeError("read retry loop exited unexpectedly")
 
     def _ensure_db_file_generation(self) -> None:
         """Mint a once-per-file generation stamp (state_meta + application_id). First opener wins (INSERT
@@ -1229,9 +1232,27 @@ class SessionDB(
         recorded = self._db_sidecar_identity or {}
         base = os.fspath(self.db_path)
         if recorded:
-            return any(
-                _stat_db_file_identity(Path(base + suffix)) != ident for suffix, ident in recorded.items()
-            )
+            current = _stat_sqlite_sidecar_identity(self.db_path)
+            changed = {suffix: ident for suffix, ident in recorded.items() if current.get(suffix) != ident}
+            if not changed:
+                return False
+            if set(changed) == {"-shm"} and current.get("-shm") is not None and sys.platform.startswith("linux"):
+                old_identity = changed["-shm"]
+                try:
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    old_target = next(
+                        target.removesuffix(" (deleted)")
+                        for target, fd_path in _proc_fd_targets(os.getpid())
+                        for st in [os.stat(fd_path)]
+                        if " (deleted)" not in target and (st.st_dev, st.st_ino) == old_identity
+                    )
+                    os.replace(old_target, base + "-shm")
+                except (OSError, StopIteration):
+                    return True
+                else:
+                    self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
+                    return False
+            return True
         if not self._wal_active:  # no sidecar generation to lose; keep /proc off the hot path
             return False
         if sys.platform.startswith("linux"):
@@ -1376,7 +1397,9 @@ class SessionDB(
         Takes the connection as a parameter: callers are lock-held close paths, and the
         writer-conn thread-safety audit flags self._conn in functions outside `with self._lock`."""
         if not self._connection_pinned:
-            self._retire_connection(conn)
+            retire_connection = self._retire_connection
+            assert retire_connection is not None  # callers prove retirement is available
+            retire_connection(conn)
             self._connection_pinned = True
 
     def _settle_lost_generation_locked(self) -> bool:
@@ -1622,7 +1645,9 @@ class SessionDB(
         """Read state_meta[key] on self._lock (not _read_ctx): fts_rebuild_step reads progress before its
         write transaction and a WAL reader would not see it."""
         with self._lock:
-            row = self._conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            conn = self._conn
+            assert conn is not None  # close() cannot clear the writer connection while this lock is held
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
 
     def set_meta(self, key: str, value: str, *, cursor: Optional[sqlite3.Cursor] = None) -> None:
