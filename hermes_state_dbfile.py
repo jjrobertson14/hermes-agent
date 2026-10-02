@@ -136,9 +136,24 @@ def _stat_sqlite_sidecar_identity(db_path: Path) -> Dict[str, tuple]:
 def _watched_sqlite_sidecar_paths(db_path) -> Dict[str, str]:
     """Map each sidecar's canonical (/proc-comparable) form to its literal, still-named path,
     so a canonical match can be re-``stat``'d for identity rather than trusted as text."""
-    base = os.path.abspath(os.fspath(db_path))
-    literal = (base + "-wal", base + "-shm")
-    return {canonical_sqlite_path(path): path for path in literal}
+    literal_base = os.path.abspath(os.fspath(db_path))
+    literal = (literal_base + "-wal", literal_base + "-shm")
+    watched = {canonical_sqlite_path(path): path for path in literal}
+    # /proc reports the kernel-resolved dentry, so the watched canonicals must also resolve
+    # symlinks -- with abspath alone a symlinked HERMES_HOME makes every deleted sidecar
+    # invisible to the scan. Both spellings are watched: the fully resolved path, which is
+    # where current SQLite places -wal/-shm when the database file itself is a symlink, and
+    # the realpath'd parent with the literal basename, which is where they land when SQLite
+    # names the sidecars after the path it was opened through.
+    resolved_bases = (
+        os.path.join(os.path.realpath(os.path.dirname(literal_base)),
+                     os.path.basename(literal_base)),
+        os.path.realpath(literal_base),
+    )
+    for base in resolved_bases:
+        for suffix in ("-wal", "-shm"):
+            watched.setdefault(canonical_sqlite_path(base + suffix), base + suffix)
+    return watched
 
 
 def _identity_is_truly_unlinked(identity: "Tuple[int, int]", watched_path: str) -> bool:
@@ -216,6 +231,13 @@ _DARWIN_FD_DEV_OFFSET = 24
 _DARWIN_FD_INO_OFFSET = 32
 _DARWIN_FD_PATH_OFFSET = 176
 _DARWIN_LIBPROC = None
+
+# Wall-clock budget for one darwin holder-scan pass (#113187). A single
+# proc_pidfdinfo call can block uninterruptibly in the kernel (a process stuck
+# in uninterruptible I/O on a dead network share), so no per-iteration check
+# can bound it: the whole pass runs in a daemon thread and is abandoned on
+# expiry, failing open per the guard's contract.
+_DARWIN_FD_SCAN_TIMEOUT_SECONDS = 5.0
 
 
 def _darwin_libproc():
@@ -301,10 +323,32 @@ def _iter_darwin_sidecar_holders(db_path) -> List[Tuple[int, str]]:
     # spelled it; ``os.path.normcase`` is the identity on darwin, so fold case here.
     watched = {path.casefold(): path for path in (base + "-wal", base + "-shm")}
     holders: List[Tuple[int, str]] = []
-    for pid, _fd, target, identity in _iter_darwin_fd_targets():
-        literal = watched.get(target.casefold())
-        if literal is not None and _identity_is_truly_unlinked(identity, literal):
-            holders.append((pid, target))
+    errors: List[BaseException] = []
+
+    def _scan() -> None:
+        try:
+            for pid, _fd, target, identity in _iter_darwin_fd_targets():
+                literal = watched.get(target.casefold())
+                if literal is not None and _identity_is_truly_unlinked(identity, literal):
+                    holders.append((pid, target))
+        except BaseException as exc:
+            errors.append(exc)
+
+    # ponytail: abandoned daemon thread per timed-out scan; a kernel-blocked
+    # proc_pidfdinfo cannot be interrupted, so expiry leaks one thread that
+    # dies with the process. Fail open: partial/empty holders, never a refusal.
+    worker = threading.Thread(target=_scan, daemon=True)
+    worker.start()
+    worker.join(_DARWIN_FD_SCAN_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        logger.warning(
+            "deleted-WAL holder scan timed out after %.1fs for %s; continuing fail-open",
+            _DARWIN_FD_SCAN_TIMEOUT_SECONDS,
+            db_path,
+        )
+        return []
+    if errors:
+        raise errors[0]
     return holders
 
 
@@ -332,6 +376,10 @@ def iter_deleted_sqlite_sidecar_holders(db_path) -> List[Tuple[int, str]]:
                 canonical = canonical_sqlite_path(target)
                 if (" (deleted)" in target and canonical in watched
                         and _fd_is_truly_unlinked(fd_path, watched[canonical])):
+                    if pid == os.getpid():
+                        from hermes_state_generation_anchor import is_fallback_fd_path
+                        if is_fallback_fd_path(fd_path):
+                            continue
                     holders.append((pid, target))
     except Exception as exc:
         logger.debug("deleted-WAL holder scan failed for %s: %s", db_path, exc)
@@ -616,23 +664,29 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     handle = lock_path.open("a+b")
     acquired = False
+    unlock: Optional[Callable[[], None]] = None
     try:
+        try_lock: Callable[[], None]
         if platform.system() == "Windows":
             import msvcrt
+            locking = getattr(msvcrt, "locking")
+            nonblocking_lock = getattr(msvcrt, "LK_NBLCK")
+            unlock_lock = getattr(msvcrt, "LK_UNLCK")
+
             def _lock(mode):  # msvcrt locks a byte range from the current position
                 handle.seek(0)
-                msvcrt.locking(handle.fileno(), mode, 1)
+                locking(handle.fileno(), mode, 1)
 
-            _try_lock = lambda: _lock(msvcrt.LK_NBLCK)  # noqa: E731
-            _unlock = lambda: _lock(msvcrt.LK_UNLCK)  # noqa: E731
+            try_lock = lambda: _lock(nonblocking_lock)  # noqa: E731
+            unlock = lambda: _lock(unlock_lock)  # noqa: E731
         else:
             import fcntl
-            _try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
-            _unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # noqa: E731
+            try_lock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # noqa: E731
+            unlock = lambda: fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # noqa: E731
         deadline = time.monotonic() + timeout
         while not acquired:
             try:
-                _try_lock()
+                try_lock()
                 acquired = True
             except OSError:
                 if time.monotonic() >= deadline:
@@ -642,7 +696,8 @@ def quarantine_cross_process_lock(path: Path, timeout: float = 5.0):
     finally:
         try:
             if acquired:
-                _unlock()
+                assert unlock is not None  # acquisition only follows a platform-specific lock setup
+                unlock()
         except (OSError, AttributeError):
             pass
         finally:
