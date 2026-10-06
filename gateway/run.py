@@ -28,7 +28,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Tuple, cast
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Any, List, Tuple, cast
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
@@ -140,7 +140,7 @@ def _hygiene_cooldown_for_failure(gateway, session_key: str, base_cooldown_secon
     increment = getattr(_gateway_session_db_inner(gateway), "increment_hygiene_failure_streak", None)
     if callable(increment):
         try:
-            streak = max(1, int(increment(session_key)))
+            streak = max(1, int(cast(Any, increment)(session_key)))
             if state is not None:
                 state.hygiene_failure_streak = streak
         except Exception as exc:
@@ -253,7 +253,8 @@ async def run_codex_hygiene_compaction(
     # copy_context carries profile secret scope / HERMES_HOME override (executors don't propagate ContextVars).
     worker_future = asyncio.get_running_loop().run_in_executor(
         None, copy_context().run,
-        lambda: agent._compress_context(history, "", approx_tokens=approx_tokens, task_id=session_id or "default"))
+        lambda: cast(Any, agent)._compress_context(
+            history, "", approx_tokens=approx_tokens, task_id=session_id or "default"))
     track_worker = getattr(gateway, "_track_deferred_agent_worker", None)
     if callable(track_worker):
         # ``wait_for`` only cancels the asyncio wrapper; keep the running executor thread visible to shutdown.
@@ -762,7 +763,7 @@ async def _send_or_update_status_coro(adapter, chat_id, status_key, content, met
     """
     sender = getattr(adapter, "send_or_update_status", None)
     if callable(sender):
-        return await sender(chat_id, status_key, content, metadata=metadata)
+        return await cast(Any, sender)(chat_id, status_key, content, metadata=metadata)
     return await adapter.send(chat_id, content, metadata=metadata)
 
 
@@ -1765,7 +1766,7 @@ async def _resolve_handoff_watch_scopes(runner: object) -> list:
         return [(None, None)]
     offload = getattr(runner, "_run_in_executor_with_context", None)
     if callable(offload):
-        return await offload(_handoff_watch_scopes, runner)
+        return await cast(Any, offload)(_handoff_watch_scopes, runner)
     return _handoff_watch_scopes(runner)
 
 
@@ -1777,7 +1778,7 @@ async def _reclaim_stale(runner: object) -> None:
     if not callable(reclaim):
         return
     try:
-        ids = await reclaim(
+        ids = await cast(Any, reclaim)(
             "gateway stopped mid-handoff; state reclaimed at startup. Re-run /handoff to try again.")
     except Exception:
         logger.debug("Stale-handoff reclaim raised", exc_info=True)
@@ -2265,9 +2266,9 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = _getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        gateway_allow_all = cast(str, _getenv("GATEWAY_ALLOW_ALL_USERS", "")).lower() in {"true", "1", "yes"}
         if gateway_allow_all or (
-                allow_all_env and _getenv(allow_all_env, "").lower() in {"true", "1", "yes"}):
+                allow_all_env and cast(str, _getenv(allow_all_env, "")).lower() in {"true", "1", "yes"}):
             continue
         return f"{platform.value}: open policy without allow-all opt-in"
     return None
@@ -2432,7 +2433,7 @@ def _resolve_gateway_model_context(
     def _custom_ctx() -> Optional[int]:
         from hermes_cli.config import get_custom_provider_context_length
         return get_custom_provider_context_length(
-            model=resolved_model, base_url=base_url, custom_providers=custom_providers)
+            model=resolved_model, base_url=cast(str, base_url), custom_providers=custom_providers)
 
     _best_effort(_read_config)
     _best_effort(_read_runtime)
@@ -2595,7 +2596,7 @@ async def _probe_audio_duration(path: str) -> Optional[str]:
         try:
             def _ogg_duration() -> float:
                 from mutagen.oggopus import OggOpus
-                return float(OggOpus(path).info.length)
+                return float(cast(Any, OggOpus(path).info).length)
             return _format_duration(await asyncio.to_thread(_ogg_duration))
         except Exception:
             pass
@@ -3099,7 +3100,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
 
 # Weak ref to the active GatewayRunner; tools like send_message route through its live adapters.
 import weakref as _weakref
-_gateway_runner_ref: _weakref.ref = lambda: None
+_gateway_runner_ref: Any = lambda: None
 
 
 def _normalize_empty_agent_response(
@@ -3273,7 +3274,7 @@ def _reconnect_attention_after_secs() -> float:
     agent_cfg = load_config_readonly().get("agent")
     raw = agent_cfg.get("reconnect_attention_after") if isinstance(agent_cfg, dict) else None
     try:
-        return float(raw)
+        return float(cast(Any, raw))
     except (TypeError, ValueError):
         return float(_DEFAULT_CONFIG["agent"]["reconnect_attention_after"])
 
@@ -3400,7 +3401,8 @@ class GatewayRunner(
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
-    _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
+    if not TYPE_CHECKING:
+        _profile_failed_platforms = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
     _startup_warmup_task: Optional[asyncio.Task] = None
@@ -4118,14 +4120,17 @@ class GatewayRunner(
         except Exception:
             pass
 
-    @property
-    def async_session_store(self) -> AsyncSessionStore:
-        """Return the single async facade for this runner's SessionStore."""
-        facade = getattr(self, "_async_session_store", None)
-        if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
-            self._async_session_store = facade
-        return facade
+    if TYPE_CHECKING:
+        async_session_store: AsyncSessionStore
+    else:
+        @property
+        def async_session_store(self) -> AsyncSessionStore:
+            """Return the single async facade for this runner's SessionStore."""
+            facade = getattr(self, "_async_session_store", None)
+            if facade is None or facade._store is not self.session_store:
+                facade = AsyncSessionStore(self.session_store)
+                self._async_session_store = facade
+            return facade
 
     def _get_cached_session_source(self, session_key: str):
         cached_sources = getattr(self, "_session_sources", None) if session_key else None
@@ -4303,7 +4308,7 @@ class GatewayRunner(
         """Run blocking work in the thread pool while preserving session contextvars."""
         loop = asyncio.get_running_loop()
         ctx = copy_context()
-        return await loop.run_in_executor(self._get_executor(), ctx.run, func, *args)
+        return await loop.run_in_executor(self._get_executor(), cast(Any, ctx.run), func, *args)
 
     async def _run_housekeeping_in_executor(self, func, *args):
         """Run best-effort session housekeeping off the TURN pool.
@@ -4318,7 +4323,7 @@ class GatewayRunner(
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._get_housekeeping_executor(), copy_context().run, func, *args)
+            self._get_housekeeping_executor(), cast(Any, copy_context().run), func, *args)
 
     def _get_or_create_pool(self, attr: str, make_pool: Callable[[], concurrent.futures.Executor]) -> concurrent.futures.Executor:
         """Return (creating under ``_executor_lock``) the pool at ``attr``; one lock + closing flag fences both."""
@@ -4801,10 +4806,14 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
         if profile_adapters is None:
             continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
-            if profile_name is not None and not profile_adapters and adapters:
+            if profile_name is not None and adapters:
                 routes = sched_preflight._primary_profile_routes_for_current_home()
                 if routes:
-                    profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
+                    if profile_adapters:
+                        profile_adapters = sched_preflight.SharedRouteAdapters(
+                            adapters, routes, profile_adapters)
+                    else:
+                        profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
             cron_scheduler.drain_delivery_queue(profile_adapters, loop)
 
 
@@ -5891,7 +5900,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     if threading.current_thread() is threading.main_thread():
         # add_signal_handler raises NotImplementedError on Windows; SIGUSR1 is POSIX-only.
-        handlers = [(sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
+        handlers: list[tuple[Any, Callable[..., None], tuple[Any, ...]]] = [
+            (sig, shutdown_signal_handler, (sig,)) for sig in (signal.SIGINT, signal.SIGTERM)]
         if hasattr(signal, "SIGUSR1"):
             handlers.append((signal.SIGUSR1, restart_signal_handler, ()))  # windows-footgun: ok — hasattr-guarded
         for sig, handler, args in handlers:

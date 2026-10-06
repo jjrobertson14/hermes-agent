@@ -12,7 +12,7 @@ import threading
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ def _profile_entry(entry) -> tuple:
     return entry if isinstance(entry, tuple) else (None, entry)
 
 
-def _existing_profile_homes(profile_homes: list) -> list:
+def _existing_profile_homes(profile_homes) -> list:
     """Drop homes no longer on disk: ticking/heartbeating a deleted home would recreate its
     ``cron/`` workspace and silently resurrect the profile.
 
@@ -85,7 +85,7 @@ def _existing_profile_homes(profile_homes: list) -> list:
         # Live enumerator (multiplex gateway): a profile created after startup is ticked without a
         # restart; a raising enumerator keeps this cycle at zero homes rather than killing the ticker.
         try:
-            profile_homes = list(profile_homes())
+            profile_homes = list(cast(Any, profile_homes)())
         except Exception:
             logger.warning("cron profile enumeration failed; skipping this cycle", exc_info=True)
             return []
@@ -539,8 +539,11 @@ class InProcessCronScheduler(CronScheduler):
             if profile_name is None or profile_name == default_profile:
                 return adapters
             tick_adapters = (profile_adapters or {}).get(profile_name) or {}
-            if not tick_adapters and adapters:
-                return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+            routes = _primary_profile_routes_for_current_home() if adapters else []
+            if routes:
+                if tick_adapters:
+                    return SharedRouteAdapters(adapters, routes, tick_adapters)
+                return SharedRouteAdapters(adapters, routes)
             return tick_adapters
 
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
