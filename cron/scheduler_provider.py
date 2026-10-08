@@ -19,6 +19,9 @@ logger = logging.getLogger(__name__)
 # Cap for exponential tick backoff during fd exhaustion (interval doubled per failure).
 _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60
 DEFAULT_MISFIRE_GRACE_MINUTES = 10
+_REFLECTION_RECOVERY_FOOTER = (
+    "🚨 REFLECTION JOB FAILED TO BE COMPLETED -- cron runtime interrupted 🚨"
+)
 
 
 # Cap for the exponential tick backoff applied while consecutive ticks fail with fd exhaustion
@@ -63,6 +66,19 @@ def _guarded_store_write(action, description, *args, **kwargs):
         action(*args, **kwargs)
     except BaseException as e:  # noqa: BLE001 - mirror the tick body's BaseException policy
         logger.warning("Cron %s write failed: %s", description, e, exc_info=True)
+
+
+def _drain_execution_recovery_outbox() -> int:
+    from cron import delivery_queue
+    from cron.executions import drain_execution_recovery_outbox
+
+    return drain_execution_recovery_outbox(delivery_queue.enqueue)
+
+
+def _drain_recovery_outbox_for_startup() -> None:
+    drained = _drain_execution_recovery_outbox()
+    if drained:
+        logger.warning("Queued %d pending cron recovery alarm(s) for delivery", drained)
 
 
 def _profile_entry(entry) -> tuple:
@@ -177,20 +193,27 @@ class CronScheduler(ABC):
     def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
         """Durably claim one fire + create its audit attempt. Transports call this synchronously
         before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
-        from cron.executions import create_execution, finish_execution, set_execution_occurrence
+        from cron.executions import (
+            create_execution, execution_recovery_claim, finish_execution,
+            set_execution_occurrence, snapshot_execution_recovery_alarm,
+        )
         from cron.jobs import claim_job_for_fire
 
         execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
+        claim_kwargs: dict[str, Any] = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
         if manual:
             claim_kwargs["manual"] = True
         try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+            with execution_recovery_claim(execution["id"], _REFLECTION_RECOVERY_FOOTER):
+                claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
             if isinstance(claimed_job, dict):
                 set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
-        except BaseException as exc:
+                snapshot_execution_recovery_alarm(
+                    execution["id"], claimed_job, _REFLECTION_RECOVERY_FOOTER, for_failure=True
+                )
+        except Exception as exc:
             finish_execution(
                 execution["id"], success=False,
                 error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
@@ -237,6 +260,24 @@ def provider_fire_due_accepts(provider: Any, name: str) -> bool:
         )
         for p in parameters
     )
+
+
+def callable_accepts_keywords(func: Any, *names: str) -> bool:
+    """Whether ``func`` accepts every keyword in ``names`` or arbitrary keyword args."""
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    accepted = set()
+    for parameter in parameters:
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        ):
+            accepted.add(parameter.name)
+    return all(name in accepted for name in names)
 
 
 def provider_supports_split_fire(provider: Any) -> bool:
@@ -450,6 +491,7 @@ class InProcessCronScheduler(CronScheduler):
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
                 )
+            _drain_recovery_outbox_for_startup()
             # Heartbeat before the first sleep so `hermes cron status` sees a live ticker
             # immediately.
             record_ticker_heartbeat()
@@ -559,6 +601,7 @@ class InProcessCronScheduler(CronScheduler):
                             "Marked %d interrupted cron execution(s) for profile at %s",
                             recovered, home,
                         )
+                    _drain_recovery_outbox_for_startup()
                     record_ticker_heartbeat()
             except BaseException as e:
                 logger.error(

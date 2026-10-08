@@ -200,6 +200,8 @@ def _hand_off_primary_routed_run(job: Dict[str, Any], extra_prompt: Optional[str
                 f"gateway's profile route, which has no standalone sender. {cause}"),
         })
     updated = trigger_job(job["id"], extra_prompt=extra_prompt)
+    if updated is None:
+        return tool_error(f"Failed to queue job '{job['id']}' for the gateway ticker.", success=False)
     _notify_provider_jobs_changed_safe()
     return _dumps({
         "success": True,
@@ -264,7 +266,11 @@ def _execute_job_now(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
     CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through
     the shared ``run_one_job`` body. Returns {"claimed", "success", "error"}."""
     claimed_job, err = _claim_for_manual_run(job["id"], "immediate run")
-    return err if err is not None else _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    if err is not None:
+        return err
+    if claimed_job is None:
+        return {"claimed": False, "success": False, "error": "Failed to claim cron job."}
+    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 
 
 @contextlib.contextmanager
@@ -293,6 +299,8 @@ def _run_heartbeat(job_name: str):
         activity_cb = None
 
     def _heartbeat_loop() -> None:
+        if activity_cb is None:
+            return
         started = time.monotonic()
         while not stop.wait(_CRON_RUN_HEARTBEAT_INTERVAL):
             elapsed = time.monotonic() - started
@@ -355,11 +363,12 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         # HERMES_HOME bound to the owning profile, so resolve that profile's adapters the way the
         # ticker (``tick_adapters_for``) does — fail closed, never the default bot (#124248). A
         # resolution error propagates to the ``except`` below and marks the run failed.
-        if runner is not None and hasattr(runner, "_adapters_for_profile"):
+        adapters_for_profile = getattr(runner, "_adapters_for_profile", None) if runner is not None else None
+        if callable(adapters_for_profile):
             from hermes_constants import get_hermes_home, profile_name_for_home
 
             profile = profile_name_for_home(get_hermes_home())
-            adapters = runner._adapters_for_profile(profile)
+            adapters = adapters_for_profile(profile)
             # A credentialless shared-bot satellite borrows the primary's bot for ROUTED targets
             # only — the same grant the ticker's ``tick_adapters_for`` makes, never the full map.
             if getattr(runner, "_is_shared_bot_satellite", lambda _p: False)(profile):
@@ -404,6 +413,7 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             # job marked in-flight. Only release registrations WE took — a bare discard
             # could erase a ticker-owned entry.
             with contextlib.suppress(Exception):
+                from cron.scheduler import release_running_job
                 release_running_job(job_id)
         with contextlib.suppress(Exception):
             mark_job_run(job_id, False, str(e), expected_fire_owner=fire_owner)
@@ -567,6 +577,8 @@ def _try_dispatch_background_run(
         if err["claimed"]:
             err["dispatched"] = False
         return err
+    if claimed_job is None:
+        return {"claimed": False, "success": False, "error": "Failed to claim cron job."}
 
     origin_ui_session_id = ""
     try:
@@ -690,6 +702,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             reasoning_effort=a["reasoning_effort"], interpreter=a["interpreter"],
             pinned=bool(a["pinned"]),
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            failure_alarm=a["failure_alarm"],
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -832,6 +845,8 @@ def _update_core_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[st
                 return bot_chat_error
             _norm_fd = _resolve_cron_context_deliver(_norm_fd)
         updates["failure_deliver"] = _norm_fd
+    if a["failure_alarm"] is not None:
+        updates["failure_alarm"] = a["failure_alarm"]
     if skills is not None or skill is not None:
         canonical_skills = _canonical_skills(skill, skills)
         updates["skills"] = canonical_skills
@@ -939,18 +954,34 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     if not updates:
         return tool_error("No updates provided.", success=False)
     updated = update_job(job["id"], updates)
+    if updated is None:
+        return tool_error(f"Failed to update job '{job['id']}'", success=False)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
         {"success": True, "job": _format_job(updated)}, updated, _normalize_deliver_param(a["deliver"])))
 
 
+def _action_pause(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+    updated = pause_job(job["id"], reason=a["reason"])
+    if updated is None:
+        return tool_error(f"Failed to pause job '{job['id']}'", success=False)
+    return _job_state_result(updated)
+
+
+def _action_resume(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+    updated = resume_job(job["id"])
+    if updated is None:
+        return tool_error(f"Failed to resume job '{job['id']}'", success=False)
+    return _job_state_result(updated)
+
+
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "pause": _action_pause,
+    "resume": _action_resume,
 }
 
 
@@ -1000,7 +1031,8 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
-    task_id: str = None,
+    failure_alarm: Optional[str] = None,
+    task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1021,6 +1053,8 @@ def cronjob(
         job, error = _resolve_job_or_error(job_id)
         if error is not None:
             return error
+        if job is None:
+            return tool_error(f"Job with ID or name '{job_id}' not found. Use cronjob(action='list') to inspect jobs.", success=False)
         handler = _JOB_ACTIONS.get(normalized)
         if handler is None:
             return tool_error(f"Unknown cron action '{action}'", success=False)
@@ -1093,6 +1127,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "type": "string",
                 "description": "Optional override target for FAILURE notices only (same grammar as deliver). When set, engine failure/interruption notices go here instead of the deliver target; 'local' suppresses them entirely (state still recorded in cron list/run history). Use for jobs delivering into shared channels where failure noise is unwanted. Omit = failures follow deliver (default). On update, '' clears."
             },
+            "failure_alarm": {
+                "type": "string",
+                "description": "Optional supported failure-alarm mode. Set to 'reflection' to opt this job into reflection failure alarms. Omit to preserve legacy behavior; on update, '' clears. Any other value is rejected by the job store."
+            },
             "skills": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1159,9 +1197,9 @@ def check_cronjob_requirements() -> bool:
 # create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
-    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
-    "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "failure_alarm", "skill",
+    "skills", "reason", "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent",
+    "attach_to_session", "paused_reason", "pinned")
 
 
 def _cronjob_handler(args, **kw):

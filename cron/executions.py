@@ -9,14 +9,16 @@ from __future__ import annotations
 
 import math
 import os
+import json
 import sqlite3
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -34,9 +36,43 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_REFLECTION_RECOVERY_ALARM = "reflection"
+_REFLECTION_RECOVERY_ALARM_SUFFIX = "reflection-alarm"
+_REFLECTION_RECOVERY_FOOTER = (
+    "🚨 REFLECTION JOB FAILED TO BE COMPLETED -- cron runtime interrupted 🚨"
+)
+_execution_recovery_claim: ContextVar[Optional[Tuple[str, str]]] = ContextVar(
+    "execution_recovery_claim",
+    default=None,
+)
+_RECOVERY_JOB_METADATA_KEYS = (
+    "id",
+    "name",
+    "origin",
+    "deliver",
+    "failure_deliver",
+    "attach_to_session",
+)
 
 
 # --- executions ledger --------------------------------------------------------------------------
+
+
+@contextmanager
+def execution_recovery_claim(execution_id: Optional[str], content: str) -> Iterator[None]:
+    token = None
+    if execution_id:
+        token = _execution_recovery_claim.set((execution_id, content))
+    try:
+        yield
+    finally:
+        if token is not None:
+            _execution_recovery_claim.reset(token)
+
+
+def current_execution_recovery_claim() -> Optional[Tuple[str, str]]:
+    return _execution_recovery_claim.get()
+
 
 def _connect() -> sqlite3.Connection:
     # Late imports: a scheduler daemon that outlives an on-disk upgrade already has the OLD
@@ -91,6 +127,23 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS execution_recovery_outbox (
+             alarm_key TEXT PRIMARY KEY,
+             execution_id TEXT NOT NULL UNIQUE,
+             job_json TEXT NOT NULL,
+             content TEXT NOT NULL,
+             for_failure INTEGER NOT NULL DEFAULT 1,
+             status TEXT NOT NULL CHECK(status IN ('snapshot','pending','acknowledged')),
+             created_at TEXT NOT NULL,
+             pending_at TEXT,
+             acknowledged_at TEXT
+           )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_recovery_outbox_status "
+        "ON execution_recovery_outbox(status, created_at, alarm_key)"
     )
 
 
@@ -183,12 +236,165 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     )
 
 
+def _recovery_alarm_key(execution_id: str) -> str:
+    return f"{execution_id}:{_REFLECTION_RECOVERY_ALARM_SUFFIX}"
+
+
+def _eligible_recovery_job(job: Dict[str, Any]) -> bool:
+    return (
+        str(job.get("failure_alarm") or "").strip().lower() == _REFLECTION_RECOVERY_ALARM
+        and not bool(job.get("no_agent"))
+    )
+
+
+def _safe_recovery_job_metadata(job: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        key: job[key]
+        for key in _RECOVERY_JOB_METADATA_KEYS
+        if key in job and job[key] is not None
+    }
+
+
+def _snapshot_recovery_alarm_unlocked(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    job: Dict[str, Any],
+    safe_content: str,
+    *,
+    for_failure: bool = True,
+    status: str = "snapshot",
+) -> bool:
+    row = conn.execute(
+        "SELECT status FROM executions WHERE id=?",
+        (str(execution_id),),
+    ).fetchone()
+    if row is None or row["status"] not in {"claimed", "running", "unknown"}:
+        return False
+    now = _hermes_now().isoformat()
+    alarm_key = _recovery_alarm_key(str(execution_id))
+    if not _eligible_recovery_job(job):
+        conn.execute(
+            "DELETE FROM execution_recovery_outbox WHERE execution_id=? AND status='snapshot'",
+            (str(execution_id),),
+        )
+        return False
+    job_json = json.dumps(_safe_recovery_job_metadata(job), ensure_ascii=False, sort_keys=True)
+    conn.execute(
+        """INSERT OR IGNORE INTO execution_recovery_outbox
+           (alarm_key, execution_id, job_json, content, for_failure, status, created_at, pending_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            alarm_key,
+            str(execution_id),
+            job_json,
+            str(safe_content),
+            int(bool(for_failure)),
+            status,
+            now,
+            now if status == "pending" else None,
+        ),
+    )
+    if status == "snapshot":
+        conn.execute(
+            """UPDATE execution_recovery_outbox
+               SET job_json=?, content=?, for_failure=?
+               WHERE execution_id=? AND status='snapshot'""",
+            (job_json, str(safe_content), int(bool(for_failure)), str(execution_id)),
+        )
+    return True
+
+
+def _recovery_job_for_claim(job_id: str) -> Optional[Dict[str, Any]]:
+    from cron.jobs import get_job
+
+    return get_job(str(job_id))
+
+
+def _mark_recovery_alarm_pending_unlocked(
+    conn: sqlite3.Connection,
+    execution_id: str,
+    job: Optional[Dict[str, Any]],
+) -> None:
+    if job is not None:
+        _snapshot_recovery_alarm_unlocked(
+            conn,
+            execution_id,
+            job,
+            _REFLECTION_RECOVERY_FOOTER,
+            for_failure=True,
+            status="pending",
+        )
+    conn.execute(
+        """UPDATE execution_recovery_outbox
+           SET status='pending', pending_at=COALESCE(pending_at, ?)
+           WHERE execution_id=? AND status='snapshot'""",
+        (_hermes_now().isoformat(), str(execution_id)),
+    )
+
+
+def snapshot_execution_recovery_alarm(
+    execution_id: str,
+    job: Dict[str, Any],
+    safe_content: str,
+    *,
+    for_failure: bool = True,
+) -> bool:
+    """Persist safe recovery-alarm metadata for an active opted-in reflection attempt."""
+    with _transaction() as conn:
+        return _snapshot_recovery_alarm_unlocked(
+            conn,
+            execution_id,
+            job,
+            safe_content,
+            for_failure=for_failure,
+        )
+
+
+def acknowledge_execution_recovery_outbox(alarm_key: str) -> bool:
+    """Acknowledge a pending recovery alarm after a queue handoff completes."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE execution_recovery_outbox
+               SET status='acknowledged', acknowledged_at=?
+               WHERE alarm_key=? AND status='pending'""",
+            (_hermes_now().isoformat(), str(alarm_key)),
+        )
+    return cur.rowcount == 1
+
+
+def drain_execution_recovery_outbox(
+    enqueue_callback: Callable[..., Any], *, limit: int = 20
+) -> int:
+    """Hand pending recovery alarms to a durable delivery queue without replaying uncertain sends."""
+    processed = 0
+    for _ in range(max(0, int(limit))):
+        with _transaction() as conn:
+            row = conn.execute(
+                """SELECT * FROM execution_recovery_outbox
+                   WHERE status='pending'
+                   ORDER BY julianday(pending_at), pending_at, alarm_key LIMIT 1"""
+            ).fetchone()
+        if row is None:
+            break
+        alarm_key = str(row["alarm_key"])
+        enqueue_callback(
+            alarm_key,
+            json.loads(str(row["job_json"])),
+            str(row["content"]),
+            for_failure=bool(row["for_failure"]),
+        )
+        acknowledge_execution_recovery_outbox(alarm_key)
+        processed += 1
+    return processed
+
+
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch."""
     from cron.occurrences import scheduled_instant as canonical_instant
 
+    recovery_job = _recovery_job_for_claim(str(job_id))
     now = _hermes_now().isoformat()
     execution_id = uuid.uuid4().hex
     pid = os.getpid()
@@ -201,6 +407,14 @@ def create_execution(
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
              _process_start_time(pid), now, canonical_instant(scheduled_instant)),
         )
+        if recovery_job is not None:
+            _snapshot_recovery_alarm_unlocked(
+                conn,
+                execution_id,
+                recovery_job,
+                _REFLECTION_RECOVERY_FOOTER,
+                for_failure=True,
+            )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record  # type: ignore[return-value]
@@ -331,39 +545,45 @@ def recover_interrupted_executions() -> int:
     stale_after: Optional[float] = None
     stale_after_resolved = False
     with _transaction() as conn:
-        rows = conn.execute(
-            """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at
-               FROM executions
-               WHERE status IN ('claimed','running')"""
-        ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """SELECT id, job_id, status, process_id, pid, process_started_at,
+                          handoff_pending, handoff_started_at, claimed_at
+                   FROM executions
+                   WHERE status IN ('claimed','running')"""
+            ).fetchall()
+        ]
+    candidates: List[tuple[Dict[str, Any], str]] = []
+    for row in rows:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        reason = _OWNER_GONE_REASON
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            # A live owner is normally a legitimately running job. A worker permanently
+            # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
+            # this check, so a claim older than the derived bound is treated as wedged
+            # and released — the external-worker wait loop polls this ledger for a
+            # terminal status, so the job can fire again. The wedged worker PROCESS is
+            # NOT terminated here (leaked until host restart); rows owned by this process
+            # (process_id == _PROCESS_ID, in-process runs) are skipped above and remain
+            # out of scope.
+            if not stale_after_resolved:
+                stale_after = _live_owner_stale_after_seconds()
+                stale_after_resolved = True
+            if stale_after is None or _claim_age_seconds(row["claimed_at"]) <= stale_after:
                 continue
-            reason = _OWNER_GONE_REASON
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                # A live owner is normally a legitimately running job. A worker permanently
-                # deadlocked (e.g. futex_wait behind a route/proxy flip, #115692) also passes
-                # this check, so a claim older than the derived bound is treated as wedged
-                # and released — the external-worker wait loop polls this ledger for a
-                # terminal status, so the job can fire again. The wedged worker PROCESS is
-                # NOT terminated here (leaked until host restart); rows owned by this process
-                # (process_id == _PROCESS_ID, in-process runs) are skipped above and remain
-                # out of scope.
-                if not stale_after_resolved:
-                    stale_after = _live_owner_stale_after_seconds()
-                    stale_after_resolved = True
-                if stale_after is None or _claim_age_seconds(row["claimed_at"]) <= stale_after:
-                    continue
-                reason = _OWNER_WEDGED_REASON
-            handoff_started_at = row["handoff_started_at"]
-            if (
-                row["handoff_pending"]
-                and handoff_started_at is not None
-                and time.time() - float(handoff_started_at)
-                < HANDOFF_ADOPTION_GRACE_SECONDS
-            ):
-                continue
+            reason = _OWNER_WEDGED_REASON
+        handoff_started_at = row["handoff_started_at"]
+        if (
+            row["handoff_pending"]
+            and handoff_started_at is not None
+            and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
+        ):
+            continue
+        candidates.append((row, reason))
+    with _transaction() as conn:
+        for row, reason in candidates:
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
@@ -376,6 +596,7 @@ def recover_interrupted_executions() -> int:
             )
             changed += cur.rowcount
             if cur.rowcount:
+                _mark_recovery_alarm_pending_unlocked(conn, str(row["id"]), None)
                 record = _fetch(conn, row["id"])
                 if record is not None:
                     recovered.append(record)

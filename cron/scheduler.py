@@ -29,7 +29,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union, cast
 
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
@@ -277,6 +277,8 @@ def _log_tick_yield_once(reason: str) -> None:
     now = time.monotonic()
     last_reason = _last_yield_log.get("reason")
     last_at = _last_yield_log.get("at", 0.0)
+    if not isinstance(last_at, (int, float, str)):
+        last_at = 0.0
     if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
         logger.error(
             "Cron tick yielded: this process is running stale code (%s) and a "
@@ -400,7 +402,9 @@ def _upsert_incident_for_failure(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
-        withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        withheld = state == "closed" or (
+            state == "alerted" and incident is not None and _repeat_alert_withheld(incident)
+        )
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -542,8 +546,8 @@ from cron.jobs import (
     save_job_output, self_removal_delivery_allowed, self_removal_delivery_scope, use_cron_store)
 from cron.executions import (
     _TERMINAL_STATES, HANDOFF_ADOPTION_GRACE_SECONDS, create_execution, finish_execution,
-    get_execution, mark_execution_handoff_pending, mark_execution_running,
-    recover_interrupted_executions)
+    execution_recovery_claim, get_execution, mark_execution_handoff_pending, mark_execution_running,
+    recover_interrupted_executions, snapshot_execution_recovery_alarm)
 
 # Response marker that suppresses delivery (output is still saved locally for audit).
 SILENT_MARKER = "[SILENT]"
@@ -551,6 +555,70 @@ SILENT_MARKER = "[SILENT]"
 # Agent-declared failure marker for cron runs. Unlike SILENT, it is deliberately strict so a
 # report that merely quotes the token cannot turn a healthy run into a failed one.
 CRON_FAILURE_MARKER = "[CRON_FAILURE]"
+
+_REFLECTION_FAILURE_ALARM = "reflection"
+_REFLECTION_RUNTIME_ALARM_PREFIX = "[reflection_runtime_alarm]"
+_CRON_AGENT_SKIPPED_KEY = "_cron_agent_skipped"
+
+
+def _reflection_failure_alarm_enabled(job: dict) -> bool:
+    return str(job.get("failure_alarm") or "").strip().lower() == _REFLECTION_FAILURE_ALARM
+
+
+def _reflection_alarm_footer(reason: str) -> str:
+    bounded = re.sub(r"\s+", " ", reason).strip() or "agent produced no deliverable response"
+    if len(bounded) > 160:
+        bounded = bounded[:157].rstrip() + "..."
+    return f"🚨 REFLECTION JOB FAILED TO BE COMPLETED -- {bounded} 🚨"
+
+
+def _reflection_runtime_alarm_error(reason: str) -> str:
+    return f"{_REFLECTION_RUNTIME_ALARM_PREFIX} {reason.strip()}"
+
+
+def _reflection_runtime_alarm_reason(error: object) -> Optional[str]:
+    text = str(error or "").strip()
+    if not text.startswith(_REFLECTION_RUNTIME_ALARM_PREFIX):
+        return None
+    return text[len(_REFLECTION_RUNTIME_ALARM_PREFIX):].strip()
+
+
+def _reflection_runtime_failure_reason(
+    error: object, *, agent_declared: bool = False, crashed: bool = False
+) -> str:
+    if agent_declared:
+        return "agent declared failure"
+    if crashed:
+        return "cron runtime crashed"
+    text = str(error or "").lower()
+    if re.search(r"idle for \d+s\s*\(limit \d+s\)", text):
+        return "cron runtime timed out"
+    return "cron runtime reported failure"
+
+
+def _reflection_runtime_failure_alarm_error(
+    job: dict, error: object, *, agent_declared: bool = False, crashed: bool = False
+) -> Optional[str]:
+    if not _reflection_failure_alarm_enabled(job) or job.get(_CRON_AGENT_SKIPPED_KEY):
+        return None
+    return _reflection_runtime_alarm_error(
+        _reflection_runtime_failure_reason(error, agent_declared=agent_declared, crashed=crashed)
+    )
+
+
+def _mark_cron_agent_skipped(job: dict) -> None:
+    job[_CRON_AGENT_SKIPPED_KEY] = True
+
+
+def _empty_reflection_final_response_reason(final_response: object) -> Optional[str]:
+    if final_response is None:
+        return "agent returned no final response"
+    text = str(final_response)
+    if not text.strip():
+        return "agent returned empty final response"
+    if _is_cron_silence_response(text):
+        return "agent returned silence sentinel"
+    return None
 
 
 def _cron_failure_marker_error(text: str) -> Optional[str]:
@@ -1497,9 +1565,9 @@ def _run_no_agent_job(
     except Exception:
         logger.debug("Job '%s': no_agent .env reload failed", job_id, exc_info=True)
 
-    script_path = job.get("script")
+    script_path = str(job.get("script") or "")
     # Legacy/hand-edited no_agent job without a script: pause it, or it re-fires every tick.
-    if not str(script_path or "").strip():
+    if not script_path.strip():
         from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
 
         return _block_and_pause_job(job_id, job_name, NO_AGENT_WITHOUT_SCRIPT_ERROR)
@@ -1993,7 +2061,7 @@ def _run_agent_with_watchdog(
         _watch_stop.set()
         _cron_pool.shutdown(wait=False, cancel_futures=True)
 
-    if _inactivity_timeout:
+    if _inactivity_timeout and _cron_inactivity_limit is not None:
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
 
     if not isinstance(result, dict):
@@ -2077,7 +2145,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         if _compression_tip:
             _final_cron_session_id = _compression_tip
     except (Exception, KeyboardInterrupt) as e:
-        with contextlib.suppress((Exception, KeyboardInterrupt)):
+        with contextlib.suppress(Exception, KeyboardInterrupt):
             _agent_session_id = getattr(agent, "session_id", None)
             # CLI (single-process) path: the approval contextvar is only bound during gateway/TUI turns and
             # HERMES_SESSION_KEY is not in the CLI environment, so the key resolves empty here. Since #64240
@@ -2125,7 +2193,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     # because classification is best-effort metadata and must not mislabel a healthy run.
     _end_reason = "cron_complete"
     try:
-        _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
+        _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id]) or {}
         _lifecycle = _statuses.get(_final_cron_session_id)
         if _lifecycle in ("interrupted", "error", "empty"):
             _end_reason = "cron_incomplete_no_output"
@@ -2149,7 +2217,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
         from hermes_state_registry import release_or_close
-        release_or_close(_session_db)
+        release_or_close(cast(Any, _session_db))
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
@@ -2187,6 +2255,7 @@ def _prepare_job_prompt(
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
+        _mark_cron_agent_skipped(job)
         return _run_no_agent_job(job, job_id, job_name, cancel_event), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
@@ -2197,6 +2266,7 @@ def _prepare_job_prompt(
 
     _early, extra_prompt, monitor_context = _apply_monitor_gate(job, job_id, job_name, extra_prompt)
     if _early is not None:
+        _mark_cron_agent_skipped(job)
         return _early, None
 
     # Wake-gate: run the pre-check script BEFORE building the prompt; its result is passed into
@@ -2219,6 +2289,7 @@ def _prepare_job_prompt(
         if _ran_ok and not _parse_wake_gate(_script_output):
             logger.info("Job '%s' (ID: %s): wakeAgent=false, skipping agent run", job_name, job_id)
             note_cron_skipped(job)
+            _mark_cron_agent_skipped(job)
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
@@ -2254,6 +2325,7 @@ def _prepare_job_prompt(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         note_cron_skipped(job)
+        _mark_cron_agent_skipped(job)
         return (True, "", SILENT_MARKER, None), None
     return None, prompt
 
@@ -2358,7 +2430,7 @@ class _CronAgentSetup:
     """Everything ``AIAgent(...)`` needs that is resolved from job + config (or a preflight block)."""
     blocked: Optional[_RunResult] = None
     model: str = ""
-    runtime: dict = None
+    runtime: Optional[dict] = None
     prefill_messages: Any = None
     max_iterations: Any = None
     reasoning_config: Any = None
@@ -2411,6 +2483,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
+    assert runtime is not None
     pr = _cfg.get("provider_routing") or {}
     return AIAgent(
         model=setup.model,
@@ -2491,10 +2564,12 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    job.pop(_CRON_AGENT_SKIPPED_KEY, None)
 
     early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
     if early is not None:
         return early
+    assert prompt is not None
     from run_agent import AIAgent
 
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
@@ -2749,12 +2824,14 @@ def run_one_job(
                 if not post_handoff:
                     delivery_error, delivery_outcome = _deliver_crash_failure(
                         job, error, adapters=adapters, loop=loop)
+                mark_kwargs: dict[str, Any] = {"delivery_error": delivery_error}
+                if owner:
+                    mark_kwargs["expected_fire_owner"] = owner
                 mark_job_run(
                     job["id"],
                     False,
                     error,
-                    delivery_error=delivery_error,
-                    **({"expected_fire_owner": owner} if owner else {}),
+                    **mark_kwargs,
                 )
             finally:
                 finish_execution(
@@ -2866,6 +2943,11 @@ def _compose_run_delivery(
         )
         if incident_acked:
             deliver_content = ""
+        elif (
+            _reflection_failure_alarm_enabled(job)
+            and (reflection_reason := _reflection_runtime_alarm_reason(error)) is not None
+        ):
+            deliver_content = _reflection_alarm_footer(reflection_reason)
         elif agent_declared:
             # The agent already diagnosed the failure in prose; the summarizer's substring
             # heuristics would re-diagnose it ("timed out" -> blame the model service, "401" ->
@@ -2986,6 +3068,19 @@ def _save_compose_deliver(
             "Interrupted by gateway shutdown before the run finished "
             "(tool subprocess was killed mid-flight)."
         )
+
+    if d.success and _reflection_failure_alarm_enabled(job) and not job.get(_CRON_AGENT_SKIPPED_KEY):
+        reason = _empty_reflection_final_response_reason(final_response)
+        if reason is not None:
+            d.success = False
+            d.error = _reflection_runtime_alarm_error(reason)
+    elif not d.success:
+        reflection_error = _reflection_runtime_failure_alarm_error(
+            job, d.error, agent_declared=d.agent_declared
+        )
+        if reflection_error is not None:
+            d.error = reflection_error
+            d.agent_declared = False
 
     (
         deliver_content, d.blocked_config, _silent_alert, d.incident_acked, d.failure_incident_id,
@@ -3125,11 +3220,21 @@ def _deliver_crash_failure(
         return None, "suppressed_acked"
     delivery_error = None
     try:
-        delivery_error = _deliver_result(
-            job,
+        reflection_alarm_error = _reflection_runtime_failure_alarm_error(
+            job, err_text, crashed=True
+        )
+        if reflection_alarm_error is not None:
+            reflection_reason = _reflection_runtime_alarm_reason(reflection_alarm_error)
+            deliver_content = _reflection_alarm_footer(reflection_reason or "cron runtime crashed")
+        else:
             # Same text as the normal failure delivery: this run also counts toward
             # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            deliver_content = (
+                _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job)
+            )
+        delivery_error = _deliver_result(
+            job,
+            deliver_content,
             adapters=adapters,
             loop=loop,
             for_failure=True,
@@ -3288,7 +3393,7 @@ def _run_one_job_body(
             return True
 
         # Empty final_response is a soft failure so last_status is not "ok".
-        if d.success and not final_response.strip():
+        if d.success and not str(final_response or "").strip():
             d.success = False
             d.error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
@@ -3946,7 +4051,7 @@ def _acquire_tick_lock(lock_file):
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
         return lock_fd
     except OSError as exc:
         if lock_fd is not None:
@@ -3968,11 +4073,11 @@ def _acquire_tick_lock(lock_file):
 
 def _release_tick_lock(lock_fd) -> None:
     if fcntl:
-        with contextlib.suppress((OSError, IOError)):
+        with contextlib.suppress(OSError, IOError):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
     elif msvcrt:
-        with contextlib.suppress((OSError, IOError)):
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        with contextlib.suppress(OSError, IOError):
+            getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
     lock_fd.close()
 
 
@@ -4057,15 +4162,29 @@ def _sweep_mcp_orphans() -> None:
 def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     # Claim only when the worker actually starts, so a queued lease can't expire first.
-    claimed = claim_job_for_fire(job["id"], return_job=True)
+    execution_id = job.get("execution_id")
+    with execution_recovery_claim(
+        execution_id,
+        _reflection_alarm_footer("cron runtime interrupted"),
+    ):
+        claimed = claim_job_for_fire(job["id"], return_job=True)
     if not claimed:
-        finish_execution(
-            job["execution_id"], success=False, error="Fire claim lost; execution was not started.")
+        if execution_id:
+            finish_execution(
+                execution_id, success=False, error="Fire claim lost; execution was not started.")
         return True
     # CAS returns the persisted record; bool fallback only for older test doubles.
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
-    claimed_job["execution_id"] = job["execution_id"]
+    if execution_id:
+        claimed_job["execution_id"] = execution_id
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    if execution_id:
+        snapshot_execution_recovery_alarm(
+            execution_id,
+            claimed_job,
+            _reflection_alarm_footer("cron runtime interrupted"),
+            for_failure=True,
+        )
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
