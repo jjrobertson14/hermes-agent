@@ -4,13 +4,6 @@ import concurrent.futures
 import contextlib
 
 
-def _drain_execution_recovery_outbox() -> int:
-    from cron import delivery_queue
-    from cron.executions import drain_execution_recovery_outbox
-
-    return drain_execution_recovery_outbox(delivery_queue.enqueue)
-
-
 def tick(verbose=True, adapters=None, loop=None, sync=True, *, can_dispatch=None):
     from hermes_cli.backend_retirement import retirement
 
@@ -53,12 +46,6 @@ def _tick_admitted(
         if can_dispatch is not None and not can_dispatch():
             _sched.logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
-
-        _drained_recovery = _drain_execution_recovery_outbox()
-        if _drained_recovery:
-            _sched.logger.warning(
-                "Queued %d pending cron recovery alarm(s) for delivery", _drained_recovery
-            )
 
         from cron.bot_chat_delivery import drain, drain_in_background
         if sync:

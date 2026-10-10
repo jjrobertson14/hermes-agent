@@ -759,7 +759,6 @@ def _cron_schedule(
     """Validate a cron expression with croniter and build the stored schedule dict."""
     if not _ensure_croniter():
         raise ValueError(f"{missing_croniter} Install with: pip install croniter")
-    assert croniter is not None
     try:
         croniter(expr)
     except Exception as e:
@@ -1019,7 +1018,6 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
     expr = schedule.get("expr")
     if not expr:
         return None
-    assert croniter is not None
     if expr in _cron_cadence_cache:
         return _cron_cadence_cache[expr]
     try:
@@ -1191,7 +1189,6 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 "reinstall hermes-agent or run 'pip install croniter' in your runtime env.",
                 expr)
             return None
-        assert croniter is not None
         # Anchor cron matching to the CONFIGURED IANA timezone's WALL CLOCK,
         # not to the UTC offset carried by ``base_time``. croniter ignores
         # the tzinfo on its start time and uses the start's UTC offset as its
@@ -1712,18 +1709,6 @@ def _normalize_failure_deliver(value: Any) -> Optional[str]:
     return _normalize_job_optional_text(value)
 
 
-def _normalize_failure_alarm(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = _normalize_job_optional_text(value)
-    if text is None:
-        return None
-    canonical = text.lower()
-    if canonical != "reflection":
-        raise ValueError("Invalid failure_alarm value: use 'reflection' or leave it blank to clear.")
-    return canonical
-
-
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
@@ -1759,7 +1744,6 @@ _CREATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "no_agent": bool,
     "context_from": _normalize_context_from,
     "failure_deliver": _normalize_failure_deliver,
-    "failure_alarm": _normalize_failure_alarm,
     "interpreter": _normalize_job_optional_text,
 }
 _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
@@ -1768,7 +1752,6 @@ _UPDATE_FIELD_NORMALIZERS: Dict[str, Callable[[Any], Any]] = {
     "monitor_url": _normalize_job_optional_text,
     "interpreter": _normalize_job_optional_text,
     "reasoning_effort": _normalize_reasoning_effort,
-    "failure_alarm": _normalize_failure_alarm,
 }
 
 
@@ -1836,7 +1819,6 @@ def create_job(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
-    failure_alarm: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: bool = False,
@@ -1890,8 +1872,7 @@ def create_job(
         or (f["script"] if f["no_agent"] else None)
         or "cron job"
     )
-    name = (name or label_source or "cron job")[:50].strip()
-    assert name is not None
+    name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
     next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
@@ -1937,8 +1918,7 @@ def create_job(
     # jobs.
     for key, value in (
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
-        ("failure_deliver", f["failure_deliver"]), ("failure_alarm", f["failure_alarm"]),
-        ("interpreter", f["interpreter"]),
+        ("failure_deliver", f["failure_deliver"]), ("interpreter", f["interpreter"]),
     ):
         if value is not None:
             job[key] = value
@@ -2125,8 +2105,6 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
-        if "failure_alarm" in updates and updates["failure_alarm"] is None:
-            updated.pop("failure_alarm", None)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
         if {"monitor_script", "monitor_url", "no_agent", "script"}.intersection(updates):
@@ -2741,45 +2719,9 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def _eligible_recovery_alarm_job(job: Dict[str, Any]) -> bool:
-    return (
-        str(job.get("failure_alarm") or "").strip().lower() == "reflection"
-        and not bool(job.get("no_agent"))
-    )
-
-
-def _snapshot_actual_recovery_alarm_claim(
-    execution_id: str,
-    job_snapshot: Dict[str, Any],
-    recovery_alarm_content: str,
-) -> None:
-    from cron.executions import snapshot_execution_recovery_alarm
-
-    snapshotted = snapshot_execution_recovery_alarm(
-        execution_id,
-        job_snapshot,
-        recovery_alarm_content,
-        for_failure=True,
-    )
-    if _eligible_recovery_alarm_job(job_snapshot) and not snapshotted:
-        raise RuntimeError("Eligible cron recovery alarm snapshot was not persisted")
-
-
-def _claim_recovery_alarm_metadata(
-    execution_id: Optional[str],
-    recovery_alarm_content: Optional[str],
-) -> Optional[Tuple[str, str]]:
-    if execution_id is not None and recovery_alarm_content is not None:
-        return str(execution_id), str(recovery_alarm_content)
-    from cron.executions import current_execution_recovery_claim
-
-    return current_execution_recovery_claim()
-
-
 def claim_job_for_fire(
     job_id: str, *, claim_ttl_seconds: int = FIRE_CLAIM_TTL_SECONDS, force: bool = False,
-    manual: bool = False, return_job: bool = False, execution_id: Optional[str] = None,
-    recovery_alarm_content: Optional[str] = None,
+    manual: bool = False, return_job: bool = False,
 ) -> Union[bool, Dict[str, Any]]:
     """Atomically claim a job for one external 'fire' (multi-machine at-most-once); True iff THIS
     caller won (``CronScheduler.fire_due``: exactly one of N replicas runs a job). Under the
@@ -2840,17 +2782,8 @@ def claim_job_for_fire(
             nxt = compute_next_run(job["schedule"], now.isoformat())
             if nxt:
                 job["next_run_at"] = nxt
-        job_snapshot = dict(copy.deepcopy(job), _scheduled_instant=instant)
-        claim_metadata = _claim_recovery_alarm_metadata(execution_id, recovery_alarm_content)
-        if claim_metadata is not None:
-            claim_execution_id, claim_recovery_alarm_content = claim_metadata
-            _snapshot_actual_recovery_alarm_claim(
-                claim_execution_id,
-                job_snapshot,
-                claim_recovery_alarm_content,
-            )
         save_jobs(jobs)
-        return job_snapshot if return_job else True
+        return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
     return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
 

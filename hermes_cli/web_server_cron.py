@@ -216,8 +216,6 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
         if not name:
             continue
         jobs = _call_cron_for_profile(name, "list_jobs", True)
-        if not isinstance(jobs, list):
-            continue
         if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
             return name
     return None
@@ -252,26 +250,24 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
         no_agent = bool(body.no_agent)
         _validate_dashboard_cron_effective_job(
             {"prompt": body.prompt, "skills": skills, "script": script, "no_agent": no_agent})
-        create_kwargs = {
-            "prompt": body.prompt or "",
-            "schedule": body.schedule,
-            "name": body.name,
-            "deliver": _cron_optional_text(body.deliver) or "local",
-            "skills": skills,
-            "model": _cron_optional_text(body.model),
-            "provider": _cron_optional_text(body.provider),
-            "base_url": _cron_optional_text(body.base_url, strip_trailing_slash=True),
-            "script": script,
-            "context_from": context_from,
-            "enabled_toolsets": _cron_string_list(body.enabled_toolsets),
-            "workdir": _cron_optional_text(body.workdir),
-            "no_agent": no_agent,
-        }
-        if "failure_alarm" in body.model_fields_set:
-            create_kwargs["failure_alarm"] = getattr(body, "failure_alarm", None)
-        create_kwargs.update(
-            {key: getattr(body, key) for key in ("paused", "paused_reason") if key in body.model_fields_set})
-        return _mutate_cron_for_profile(profile_name, "create_job", **create_kwargs)
+        return _mutate_cron_for_profile(
+            profile_name,
+            "create_job",
+            prompt=body.prompt or "",
+            schedule=body.schedule,
+            name=body.name,
+            deliver=_cron_optional_text(body.deliver) or "local",
+            skills=skills,
+            model=_cron_optional_text(body.model),
+            provider=_cron_optional_text(body.provider),
+            base_url=_cron_optional_text(body.base_url, strip_trailing_slash=True),
+            script=script,
+            context_from=context_from,
+            enabled_toolsets=_cron_string_list(body.enabled_toolsets),
+            workdir=_cron_optional_text(body.workdir),
+            no_agent=no_agent,
+            **{key: getattr(body, key) for key in ("paused", "paused_reason")
+               if key in body.model_fields_set})
     except HTTPException:
         raise
     except Exception as e:

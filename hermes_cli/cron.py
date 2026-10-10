@@ -6,7 +6,7 @@ import re
 import sys
 from datetime import timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, cast
+from typing import Any, Dict, Iterable, List, Optional
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -137,7 +137,7 @@ def _next_run_row(job: Dict[str, Any]) -> tuple[str, str]:
                                    "is the scheduler running?)", Colors.YELLOW))
 
 
-def _dispatch_display(dispatch: Optional[Dict[str, Any]]) -> Optional[str]:
+def _dispatch_display(dispatch: dict) -> Optional[str]:
     """One-line scheduled-vs-actual dispatch summary; None when the stamp is malformed.
 
     On-time dispatches render dim; late/catch-up dispatches render loudly so a run fired long
@@ -701,7 +701,6 @@ def cron_doctor() -> int:
 
 
 _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver", "failure_deliver"),
-                   ("failure_alarm", "failure_alarm"),
                    ("repeat", "repeat"), ("script", "script"), ("workdir", "workdir"),
                    ("model", "model"), ("provider", "model_provider"), ("pinned", "pinned"),
                    ("monitor_script", "monitor_script"), ("monitor_url", "monitor_url"),
@@ -801,7 +800,6 @@ def cron_edit(args):
 
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
     _stateless_token = None
-    _stateless_context = None
     if action == "run":
         # One-shot CLI: a background-dispatched run (daemon thread, triggered when the CLI
         # inherits HERMES_SESSION_KEY) would be orphaned mid-LLM-call, leaving the execution row
@@ -813,13 +811,12 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             # ``async_delivery_supported()`` gates it off and the run executes synchronously to completion
             # instead. See #86721.
             from gateway.session_context import _SESSION_ASYNC_DELIVERY
-            _stateless_context = _SESSION_ASYNC_DELIVERY
             _stateless_token = _SESSION_ASYNC_DELIVERY.set(False)
     try:
         result = _cron_api(action=action, job_id=job_id)
     finally:
-        if _stateless_token is not None and _stateless_context is not None:
-            _stateless_context.reset(_stateless_token)
+        if _stateless_token is not None:
+            _SESSION_ASYNC_DELIVERY.reset(_stateless_token)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -898,7 +895,7 @@ def cron_notepad(args) -> int:
             print(color(f"Usage: hermes cron notepad <job_id> {usage_args}", Colors.RED))
             return 1
         if action == "set":
-            notepad.set_note(job_id, key, cast(str, value))
+            notepad.set_note(job_id, key, value)
             print(color(f"Set notepad key '{key}' for job {job_id}.", Colors.GREEN))
             return 0
         if action == "get":
