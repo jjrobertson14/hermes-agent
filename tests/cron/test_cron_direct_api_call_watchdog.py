@@ -26,9 +26,17 @@ from unittest.mock import MagicMock
 
 import pytest
 
-sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
-sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
-sys.modules.setdefault("fal_client", types.SimpleNamespace())
+
+def _stub_module(name: str, **attrs: object) -> types.ModuleType:
+    module = types.ModuleType(name)
+    for attr_name, value in attrs.items():
+        setattr(module, attr_name, value)
+    return module
+
+
+sys.modules.setdefault("fire", _stub_module("fire", Fire=lambda *a, **k: None))
+sys.modules.setdefault("firecrawl", _stub_module("firecrawl", Firecrawl=object))
+sys.modules.setdefault("fal_client", _stub_module("fal_client"))
 
 import run_agent
 
@@ -174,25 +182,37 @@ def test_local_endpoint_infinite_budget_leaves_the_watchdog_disarmed():
 
     def _slow(**_kwargs):
         started.set()
-        assert release.wait(timeout=2.0)
+        release.wait()
         return SimpleNamespace(id="slow-but-healthy")
 
     fake_client.chat.completions.create.side_effect = _slow
     agent._create_request_openai_client.return_value = fake_client
 
-    box = {}
+    responses: list[SimpleNamespace] = []
+    errors: list[BaseException] = []
 
     def _run():
-        box["response"] = direct_api_call(agent, {"model": "m", "messages": []})
+        try:
+            responses.append(direct_api_call(agent, {"model": "m", "messages": []}))
+        except BaseException as exc:
+            errors.append(exc)
 
     worker = threading.Thread(target=_run, daemon=True)
     worker.start()
-    assert started.wait(timeout=2.0)
-    time.sleep(0.3)
-    release.set()
-    worker.join(timeout=3.0)
+    try:
+        assert started.wait(timeout=2.0)
+        assert worker.is_alive()
+        agent._abort_request_openai_client.assert_not_called()
+        release.set()
+        worker.join(timeout=3.0)
+        assert not worker.is_alive()
+    finally:
+        release.set()
+        worker.join(timeout=3.0)
 
-    assert box["response"].id == "slow-but-healthy"
+    assert errors == []
+    assert len(responses) == 1
+    assert responses[0].id == "slow-but-healthy"
     agent._abort_request_openai_client.assert_not_called()
 
 
@@ -226,22 +246,22 @@ class _StallingWireClient:
 
 def _build_cron_agent(monkeypatch):
     agent = run_agent.AIAgent.__new__(run_agent.AIAgent)
-    agent.platform = "cron"
+    setattr(agent, "platform", "cron")
     agent.api_mode = "chat_completions"
-    agent.provider = "openrouter"
+    setattr(agent, "provider", "openrouter")
     agent.base_url = "https://openrouter.ai/api/v1"
     agent._base_url = agent.base_url
-    agent.model = "some/model"
-    agent.log_prefix = ""
-    agent.quiet_mode = True
+    setattr(agent, "model", "some/model")
+    setattr(agent, "log_prefix", "")
+    setattr(agent, "quiet_mode", True)
     agent._interrupt_requested = False
     agent._interrupt_message = None
     agent._client_lock = threading.RLock()
-    agent._client_kwargs = {"api_key": "***", "base_url": agent.base_url}
-    agent.stream_delta_callback = None
-    agent._stream_callback = None
-    agent.reasoning_callback = None
-    agent.status_callback = None
+    setattr(agent, "_client_kwargs", {"api_key": "***", "base_url": agent.base_url})
+    setattr(agent, "stream_delta_callback", None)
+    setattr(agent, "_stream_callback", None)
+    setattr(agent, "reasoning_callback", None)
+    setattr(agent, "status_callback", None)
     monkeypatch.setenv("HERMES_API_CALL_STALE_TIMEOUT", "0.3")
     return agent
 
@@ -252,7 +272,8 @@ def test_e2e_cron_turn_is_bounded_through_the_real_agent_routing(monkeypatch):
     cross-thread abort → a retryable ``TimeoutError`` on the caller."""
     wire = _StallingWireClient()
     agent = _build_cron_agent(monkeypatch)
-    agent.client = wire
+    model = "some/model"
+    setattr(agent, "client", wire)
     timer_intervals = []
 
     class RequestStartedTimer:
@@ -294,7 +315,7 @@ def test_e2e_cron_turn_is_bounded_through_the_real_agent_routing(monkeypatch):
     )
 
     with pytest.raises(TimeoutError):
-        agent._interruptible_api_call({"model": agent.model, "messages": []})
+        agent._interruptible_api_call({"model": model, "messages": []})
 
     assert timer_intervals == [pytest.approx(0.3)]
     assert wire.request_started.is_set()

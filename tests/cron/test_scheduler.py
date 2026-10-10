@@ -5,6 +5,7 @@ import contextvars
 import itertools
 import json
 import os
+from typing import cast
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -327,6 +328,9 @@ class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
 
     def _safe_media_path(self, tmp_path, monkeypatch, name, data=b"media"):
+        hermes_root = tmp_path / "hermes-root"
+        (hermes_root / "profiles").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
         root = tmp_path / "media-cache"
         media_file = root / name
         media_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1503,7 +1507,7 @@ class TestParseWakeGate:
     def test_empty_output_wakes(self):
         from cron.scheduler import _parse_wake_gate
         assert _parse_wake_gate("") is True
-        assert _parse_wake_gate(None) is True
+        assert _parse_wake_gate(cast(str, None)) is True
 
     def test_wake_gate_false_skips(self):
         from cron.scheduler import _parse_wake_gate
@@ -1655,6 +1659,9 @@ class TestSendMediaViaAdapter:
     """Unit tests for _send_media_via_adapter — routes files to typed adapter methods."""
 
     def _safe_media_path(self, tmp_path, monkeypatch, name, data=b"media"):
+        hermes_root = tmp_path / "hermes-root"
+        (hermes_root / "profiles").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
         root = tmp_path / "media-cache"
         media_file = root / name
         media_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1972,6 +1979,9 @@ class TestSendMediaTimeoutCancelsFuture:
         slow.parent.mkdir(parents=True)
         slow.write_bytes(b"slow")
         fast.write_bytes(b"fast")
+        hermes_root = tmp_path / "hermes-root"
+        (hermes_root / "profiles").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_root)
         monkeypatch.setattr(
             "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
             (root,),
@@ -2010,7 +2020,7 @@ class TestCronDeliveryTargets:
                 self.value = value
 
         class _GatewayConfig:
-            def get_connected_platforms(self_inner):
+            def get_connected_platforms(self):
                 return [_Platform(n) for n in names]
 
         monkeypatch.setattr(

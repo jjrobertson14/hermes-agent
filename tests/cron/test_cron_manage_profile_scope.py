@@ -8,8 +8,11 @@ must then read THAT profile's ``cron/jobs.json``, not the launch profile's.
 """
 
 import json
+from typing import Any, cast
 
-from tui_gateway import server
+from tui_gateway import server as _server
+
+server = cast(Any, _server)
 
 
 def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
@@ -33,10 +36,14 @@ def test_cron_manage_profile_reads_that_profiles_store(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    # Route the profile name the handler resolves to our temp home.
+    # Route the server-bound profile resolver and profile-root lookups to our temp home.
     import hermes_cli.profiles as profiles
+    import hermes_cli.cron as cli_cron
 
+    monkeypatch.setattr(profiles, "_get_profiles_root", lambda: tmp_path / "profiles")
     monkeypatch.setattr(profiles, "get_profile_dir", lambda name: profile_home)
+    monkeypatch.setattr(server, "_profile_home", lambda profile: profile_home if profile == "botA" else None)
+    monkeypatch.setattr(cli_cron, "_builtin_gateway_liveness", lambda: False)
 
     resp = server.handle_request(
         {

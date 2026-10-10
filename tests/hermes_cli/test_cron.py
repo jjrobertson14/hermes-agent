@@ -44,6 +44,7 @@ class TestCronCommandLifecycle:
         cron_command(args)
 
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["model"] == "new-model"
         assert updated["provider"] == "nous"
         assert "Updated job" in capsys.readouterr().out
@@ -75,6 +76,7 @@ class TestCronCommandLifecycle:
             )
         )
         updated = get_job(job["id"])
+        assert updated is not None
         assert updated["skills"] == ["maps", "blogwatcher"]
         assert updated["name"] == "Edited Job"
         assert updated["prompt"] == "Revised prompt"
@@ -100,6 +102,7 @@ class TestCronCommandLifecycle:
             )
         )
         cleared = get_job(job["id"])
+        assert cleared is not None
         assert cleared["skills"] == []
         assert cleared["skill"] is None
 
@@ -624,7 +627,9 @@ class TestStatusSurfacesDeadScheduler:
         assert "Scheduler last ticked" not in status_out  # no heartbeat file → nothing to date
         assert "Next run:" in list_out and "Overdue:" not in list_out
 
-    def test_slash_cron_and_list_flag_overdue_but_not_paused(self, tmp_cron_dir, capsys):
+    def test_slash_cron_and_list_flag_overdue_but_not_paused(
+        self, tmp_cron_dir, capsys, monkeypatch: pytest.MonkeyPatch
+    ):
         # The in-chat `/cron` overview and `/cron list` (classic CLI + Ink TUI forward to the
         # same handler) read the same rows; a 7h-past stamp must not read as an upcoming run,
         # while a paused job keeps its plain label — pausing is why it did not fire.
@@ -635,7 +640,9 @@ class TestStatusSurfacesDeadScheduler:
 
         stale = create_job(prompt="Hourly", schedule="every 60m")
         paused = create_job(prompt="Parked", schedule="every 60m")
-        when = datetime.now(timezone.utc) - timedelta(hours=7)
+        frozen_now = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("hermes_time.now", lambda: frozen_now)
+        when = frozen_now - timedelta(hours=7)
         self._park_next_run(stale["id"], when)
         self._park_next_run(paused["id"], when)
         jobs = load_jobs()

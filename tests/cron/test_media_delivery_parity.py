@@ -41,6 +41,27 @@ def media_file(tmp_path):
     return str(p)
 
 
+@pytest.fixture(autouse=True)
+def isolated_platform_base_root(monkeypatch, tmp_path):
+    import gateway.platforms.base as base_mod
+
+    root = tmp_path / "hermes-root"
+    (root / "profiles").mkdir(parents=True)
+    cache_roots = {
+        "IMAGE_CACHE_DIR": root / "cache" / "images",
+        "AUDIO_CACHE_DIR": root / "cache" / "audio",
+        "VIDEO_CACHE_DIR": root / "cache" / "videos",
+        "DOCUMENT_CACHE_DIR": root / "cache" / "documents",
+        "SCREENSHOT_CACHE_DIR": root / "cache" / "screenshots",
+    }
+    for cache_root in cache_roots.values():
+        cache_root.mkdir(parents=True)
+    monkeypatch.setattr(base_mod, "_HERMES_ROOT", root)
+    for attr, cache_root in cache_roots.items():
+        monkeypatch.setattr(base_mod, attr, cache_root)
+    monkeypatch.setattr(base_mod, "MEDIA_DELIVERY_SAFE_ROOTS", tuple(cache_roots.values()))
+
+
 @pytest.fixture()
 def slack_job():
     return {
@@ -165,6 +186,7 @@ class TestLiveAdapterMediaFailuresSurfaced:
                 return SimpleNamespace(success=False, error="upload rejected")
 
         loop = asyncio.new_event_loop()
+        t = None
         try:
             import threading
 
@@ -179,7 +201,8 @@ class TestLiveAdapterMediaFailuresSurfaced:
             assert any("upload rejected" in e for e in errors)
         finally:
             loop.call_soon_threadsafe(loop.stop)
-            t.join(timeout=5)
+            if t is not None:
+                t.join(timeout=5)
             loop.close()
 
     def test_dropped_unsafe_path_is_reported(self, slack_job):
@@ -192,6 +215,7 @@ class TestLiveAdapterMediaFailuresSurfaced:
                 raise AssertionError("should not be called for a dropped path")
 
         loop = asyncio.new_event_loop()
+        t = None
         try:
             import threading
 
@@ -205,7 +229,8 @@ class TestLiveAdapterMediaFailuresSurfaced:
             assert errors, "a filtered-out MEDIA path must be reported, not silent"
         finally:
             loop.call_soon_threadsafe(loop.stop)
-            t.join(timeout=5)
+            if t is not None:
+                t.join(timeout=5)
             loop.close()
 
 
