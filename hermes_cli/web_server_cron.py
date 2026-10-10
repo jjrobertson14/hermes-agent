@@ -216,8 +216,13 @@ def _find_cron_job_profile(job_id: str) -> Optional[str]:
         if not name:
             continue
         jobs = _call_cron_for_profile(name, "list_jobs", True)
-        if any(j.get("id") == job_id or j.get("name") == job_id for j in jobs):
-            return name
+        if not isinstance(jobs, list):
+            continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("id") == job_id or job.get("name") == job_id:
+                return name
     return None
 
 

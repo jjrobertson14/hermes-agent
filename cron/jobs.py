@@ -41,7 +41,7 @@ from utils import atomic_replace, atomic_write_text, fsync_directory
 
 # croniter is imported lazily (slow import, only needed for cron exprs). HAS_CRONITER stays a
 # module attribute: a monkeypatched value wins because _ensure_croniter only probes while None.
-croniter = None
+croniter: Optional[Callable[..., Any]] = None
 HAS_CRONITER: Optional[bool] = None
 
 
@@ -56,6 +56,13 @@ def _ensure_croniter() -> bool:
         except ImportError:
             HAS_CRONITER = False
     return bool(HAS_CRONITER)
+
+
+def _croniter_callable() -> Optional[Callable[..., Any]]:
+    """Callable croniter constructor, or None when unavailable."""
+    if not _ensure_croniter() or not callable(croniter):
+        return None
+    return croniter
 
 
 # --- Configuration ---
@@ -757,10 +764,11 @@ def _cron_schedule(
     expr: str, display: str, missing_croniter: str, invalid_label: str
 ) -> Dict[str, Any]:
     """Validate a cron expression with croniter and build the stored schedule dict."""
-    if not _ensure_croniter():
+    croniter_fn = _croniter_callable()
+    if croniter_fn is None:
         raise ValueError(f"{missing_croniter} Install with: pip install croniter")
     try:
-        croniter(expr)
+        croniter_fn(expr)
     except Exception as e:
         raise ValueError(f"Invalid {invalid_label} '{display}': {e}")
     return {"kind": "cron", "expr": expr, "display": display}
@@ -1013,7 +1021,10 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
             return float(minutes) * 60.0 if minutes else None
         except (TypeError, ValueError):
             return None
-    if kind != "cron" or not _ensure_croniter():
+    if kind != "cron":
+        return None
+    croniter_fn = _croniter_callable()
+    if croniter_fn is None:
         return None
     expr = schedule.get("expr")
     if not expr:
@@ -1021,7 +1032,7 @@ def _schedule_cadence_seconds(schedule: Dict[str, Any]) -> Optional[float]:
     if expr in _cron_cadence_cache:
         return _cron_cadence_cache[expr]
     try:
-        it = croniter(expr, _hermes_now())
+        it = croniter_fn(expr, _hermes_now())
         first = it.get_next(datetime)
         gap = (it.get_next(datetime) - first).total_seconds()
         result = gap if gap > 0 else None
@@ -1182,7 +1193,8 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         expr = schedule.get("expr")
         if not expr:
             return None
-        if not _ensure_croniter():
+        croniter_fn = _croniter_callable()
+        if croniter_fn is None:
             logger.warning(
                 "Cannot compute next run for cron schedule %r: 'croniter' is "
                 "not installed. croniter is a core dependency as of v0.9.x; "
@@ -1202,7 +1214,7 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         # Fall back to the base's own zone only when nothing is configured.
         zone = get_timezone() or base_time.tzinfo
         base_wall = base_time.astimezone(zone).replace(tzinfo=None)
-        it = croniter(expr, base_wall)
+        it = croniter_fn(expr, base_wall)
         # Strictly-after guard for the DST fall-back hour (qwen-code#11723 class):
         # attaching the zone to a naive wall clock resolves the repeated autumn hour
         # to its EARLIER occurrence (fold=0), so a base inside the second occurrence
@@ -1872,14 +1884,14 @@ def create_job(
         or (f["script"] if f["no_agent"] else None)
         or "cron job"
     )
-    name = name or label_source[:50].strip()
+    job_name = name if name else label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
-    next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, name, schedule, "")
+    next_run_at = _next_run_or_reject_past_oneshot(parsed_schedule, job_name, schedule, "")
 
     job = {
         "id": job_id,
-        "name": name,
+        "name": job_name,
         "prompt": prompt_text,
         "skills": normalized_skills,
         "skill": normalized_skills[0] if normalized_skills else None,

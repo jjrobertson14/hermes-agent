@@ -8,13 +8,22 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union, cast
 
 import copy
 
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+class _GatewayRunner(Protocol):
+    adapters: Any
+    _gateway_loop: Any
+
+    def _adapters_for_profile(self, profile: str) -> Any: ...
+
+    def _is_shared_bot_satellite(self, profile: str) -> bool: ...
 
 # Heartbeat cadence keeping the caller's inactivity watchdog at bay while a manual
 # `cronjob(action="run")` executes in-process (comfortably below HERMES_AGENT_TIMEOUT).
@@ -200,6 +209,11 @@ def _hand_off_primary_routed_run(job: Dict[str, Any], extra_prompt: Optional[str
                 f"gateway's profile route, which has no standalone sender. {cause}"),
         })
     updated = trigger_job(job["id"], extra_prompt=extra_prompt)
+    if updated is None:
+        return _dumps({
+            "success": False,
+            "error": f"Cron job '{job['id']}' no longer exists; nothing to run.",
+        })
     _notify_provider_jobs_changed_safe()
     return _dumps({
         "success": True,
@@ -236,7 +250,9 @@ _ALREADY_RUNNING_ERROR = (
     "manual run is executing it); not started again.")
 
 
-def _claim_for_manual_run(job_id: str, log_label: str):
+def _claim_for_manual_run(
+    job_id: str, log_label: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
     """At-most-once claim shared by the sync and background run paths: ``(claimed_job, None)`` or
     ``(None, error_dict)`` in the ``_execute_job_now`` shape. A lost claim is labelled precisely —
     claim_job_for_fire also returns False for paused/disabled/missing jobs, not just in-flight ones."""
@@ -264,7 +280,11 @@ def _execute_job_now(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
     CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through
     the shared ``run_one_job`` body. Returns {"claimed", "success", "error"}."""
     claimed_job, err = _claim_for_manual_run(job["id"], "immediate run")
-    return err if err is not None else _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
+    if err is not None:
+        return err
+    if claimed_job is None:
+        return {"claimed": False, "success": False, "error": "Job no longer exists; nothing to run."}
+    return _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 
 
 @contextlib.contextmanager
@@ -288,11 +308,11 @@ def _run_heartbeat(job_name: str):
         from tools.environments.base import get_activity_callback
         # Capture on THIS thread: the callback is thread-local (installed by the tool
         # executor), so a freshly spawned thread cannot read it.
-        activity_cb = get_activity_callback()
+        activity_cb: Optional[Callable[[str], None]] = get_activity_callback()
     except Exception:
         activity_cb = None
 
-    def _heartbeat_loop() -> None:
+    def _heartbeat_loop(active_activity_cb: Callable[[str], None]) -> None:
         started = time.monotonic()
         while not stop.wait(_CRON_RUN_HEARTBEAT_INTERVAL):
             elapsed = time.monotonic() - started
@@ -304,12 +324,12 @@ def _run_heartbeat(job_name: str):
                     job_name, elapsed)
                 return
             try:
-                activity_cb(f"cronjob: running job '{job_name}' ({int(elapsed)}s elapsed)")
+                active_activity_cb(f"cronjob: running job '{job_name}' ({int(elapsed)}s elapsed)")
             except Exception:
                 continue  # one transient callback error must not drop protection
 
     if activity_cb is not None:
-        thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="cronjob-run-heartbeat")
+        thread = threading.Thread(target=_heartbeat_loop, args=(activity_cb,), daemon=True, name="cronjob-run-heartbeat")
         thread.start()
     try:
         yield
@@ -349,7 +369,7 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
         # share the process with the live platform adapters. Calling those clients from run_one_job's
         # standalone asyncio.run() loop raises errors like "Timeout context manager should be used inside a
         # task" and can break encrypted Matrix delivery (#61495 — salvaged from #63586 by @Fly-onlyone).
-        runner = runner_ref() if callable(runner_ref) else None
+        runner = cast(Optional[_GatewayRunner], runner_ref() if callable(runner_ref) else None)
         adapters = getattr(runner, "adapters", None) if runner is not None else None
         # ``runner.adapters`` is the LAUNCH profile's map; under multiplex the run executes with
         # HERMES_HOME bound to the owning profile, so resolve that profile's adapters the way the
@@ -359,6 +379,8 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             from hermes_constants import get_hermes_home, profile_name_for_home
 
             profile = profile_name_for_home(get_hermes_home())
+            if profile is None:
+                raise RuntimeError("Could not resolve profile for current HERMES_HOME")
             adapters = runner._adapters_for_profile(profile)
             # A credentialless shared-bot satellite borrows the primary's bot for ROUTED targets
             # only — the same grant the ticker's ``tick_adapters_for`` makes, never the full map.
@@ -403,6 +425,8 @@ def _run_claimed_job(job: Dict[str, Any], extra_prompt: Optional[str] = None) ->
             # Raised before the run's own release (e.g. heartbeat setup): don't leave the
             # job marked in-flight. Only release registrations WE took — a bare discard
             # could erase a ticker-owned entry.
+            from cron.scheduler import release_running_job
+
             with contextlib.suppress(Exception):
                 release_running_job(job_id)
         with contextlib.suppress(Exception):
@@ -567,6 +591,8 @@ def _try_dispatch_background_run(
         if err["claimed"]:
             err["dispatched"] = False
         return err
+    if claimed_job is None:
+        return {"claimed": False, "success": False, "error": "Job no longer exists; nothing to run."}
 
     origin_ui_session_id = ""
     try:
@@ -615,7 +641,7 @@ def _try_dispatch_background_run(
     logger.info(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name)
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
     result["dispatched"] = False
     return result
 
@@ -939,6 +965,8 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
     if not updates:
         return tool_error("No updates provided.", success=False)
     updated = update_job(job["id"], updates)
+    if updated is None:
+        return tool_error(f"Job with ID or name '{job['id']}' not found. Use cronjob(action='list') to inspect jobs.", success=False)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.
     return _dumps(_with_guidance(
@@ -946,11 +974,25 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
 
 
 _JOBLESS_ACTIONS = {"create": _action_create, "list": _action_list}
+def _action_pause(job: Dict[str, Any], a: Dict[str, Any]) -> str:
+    updated = pause_job(job["id"], reason=a["reason"])
+    if updated is None:
+        return tool_error(f"Job with ID or name '{job['id']}' not found. Use cronjob(action='list') to inspect jobs.", success=False)
+    return _job_state_result(updated)
+
+
+def _action_resume(job: Dict[str, Any], _a: Dict[str, Any]) -> str:
+    updated = resume_job(job["id"])
+    if updated is None:
+        return tool_error(f"Job with ID or name '{job['id']}' not found. Use cronjob(action='list') to inspect jobs.", success=False)
+    return _job_state_result(updated)
+
+
 _JOB_ACTIONS = {
     "remove": _action_remove, "update": _action_update,
     "run": _action_run, "run_now": _action_run, "trigger": _action_run,
-    "pause": lambda job, a: _job_state_result(pause_job(job["id"], reason=a["reason"])),
-    "resume": lambda job, a: _job_state_result(resume_job(job["id"])),
+    "pause": _action_pause,
+    "resume": _action_resume,
 }
 
 
@@ -1000,7 +1042,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[Union[str, List[str]]] = None,
-    task_id: str = None,
+    task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,

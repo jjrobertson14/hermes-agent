@@ -64,7 +64,8 @@ def import_job_definitions(shipped: Dict[str, Dict[str, Any]], *, paused_reason:
     with _jobs_lock():
         merged = []
         for local in load_jobs():
-            incoming = pending.pop(local.get("id"), None)
+            local_id = local.get("id")
+            incoming = pending.pop(local_id, None) if isinstance(local_id, str) else None
             merged.append(local if incoming is None else _merge_or_name(local, incoming))
         merged.extend(_merge_or_name({"id": job_id, **seed}, incoming) for job_id, incoming in pending.items())
         save_jobs(merged)

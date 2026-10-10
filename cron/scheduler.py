@@ -16,10 +16,11 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; Windows uses msvcrt
+msvcrt = None
 try:
     import fcntl
 except ImportError:
@@ -29,7 +30,7 @@ except ImportError:
     except ImportError:
         msvcrt = None
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Protocol, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Union, TYPE_CHECKING
 
 # Must precede repo-level imports: standalone invocations (e.g. module reload after
 # `hermes update`) otherwise fail with ModuleNotFoundError for hermes_time et al.
@@ -51,6 +52,9 @@ from agent.memory_provider import ctx_bound
 from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from hermes_state import SessionDB
 
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
@@ -277,7 +281,8 @@ def _log_tick_yield_once(reason: str) -> None:
     now = time.monotonic()
     last_reason = _last_yield_log.get("reason")
     last_at = _last_yield_log.get("at", 0.0)
-    if last_reason != reason or (now - float(last_at)) >= _YIELD_LOG_INTERVAL_SECONDS:
+    last_at_float = last_at if isinstance(last_at, (int, float)) else 0.0
+    if last_reason != reason or (now - last_at_float) >= _YIELD_LOG_INTERVAL_SECONDS:
         logger.error(
             "Cron tick yielded: this process is running stale code (%s) and a "
             "fresher gateway owns the runtime lock — jobs will fire from that "
@@ -400,7 +405,9 @@ def _upsert_incident_for_failure(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file)
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
-        withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        withheld = state == "closed" or (
+            state == "alerted" and incident is not None and _repeat_alert_withheld(incident)
+        )
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -845,15 +852,17 @@ def _cron_interval_minutes(expr: str) -> Optional[float]:
         from cron.jobs import _ensure_croniter
 
         if _ensure_croniter():
-            from cron.jobs import croniter as _croniter
+            from cron.jobs import _croniter_callable
             from datetime import datetime
 
-            base = datetime.now()
-            it = _croniter(expr, base)
-            first = it.get_next(datetime)
-            second = it.get_next(datetime)
-            gap = (second - first).total_seconds() / 60.0
-            result = gap if gap > 0 else None
+            _croniter = _croniter_callable()
+            if _croniter is not None:
+                base = datetime.now()
+                it = _croniter(expr, base)
+                first = it.get_next(datetime)
+                second = it.get_next(datetime)
+                gap = (second - first).total_seconds() / 60.0
+                result = gap if gap > 0 else None
     _cron_interval_cache[expr] = result
     return result
 
@@ -1503,6 +1512,7 @@ def _run_no_agent_job(
         from cron.jobs import NO_AGENT_WITHOUT_SCRIPT_ERROR
 
         return _block_and_pause_job(job_id, job_name, NO_AGENT_WITHOUT_SCRIPT_ERROR)
+    script_path = script_path if isinstance(script_path, str) else str(script_path)
 
     # Pass workdir as subprocess cwd; never os.chdir() (leaks into concurrent gateway sessions).
     _job_workdir = _resolve_job_workdir(job, job_id)
@@ -1994,7 +2004,9 @@ def _run_agent_with_watchdog(
         _cron_pool.shutdown(wait=False, cancel_futures=True)
 
     if _inactivity_timeout:
-        _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
+        if _cron_inactivity_limit is not None:
+            _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
+        raise TimeoutError(f"Cron job '{job_name}' idle beyond the inactivity limit")
 
     if not isinstance(result, dict):
         raise RuntimeError(
@@ -2077,7 +2089,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         if _compression_tip:
             _final_cron_session_id = _compression_tip
     except (Exception, KeyboardInterrupt) as e:
-        with contextlib.suppress((Exception, KeyboardInterrupt)):
+        with contextlib.suppress(Exception, KeyboardInterrupt):
             _agent_session_id = getattr(agent, "session_id", None)
             # CLI (single-process) path: the approval contextvar is only bound during gateway/TUI turns and
             # HERMES_SESSION_KEY is not in the CLI environment, so the key resolves empty here. Since #64240
@@ -2126,7 +2138,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
     _end_reason = "cron_complete"
     try:
         _statuses = _session_db.session_lifecycle_statuses([_final_cron_session_id])
-        _lifecycle = _statuses.get(_final_cron_session_id)
+        _lifecycle = _statuses.get(_final_cron_session_id) if isinstance(_statuses, dict) else None
         if _lifecycle in ("interrupted", "error", "empty"):
             _end_reason = "cron_incomplete_no_output"
             logger.warning(
@@ -2149,7 +2161,7 @@ def _finalize_cron_session(session_db, agent, job_id: str, job_name: str, cron_s
         logger.debug("Job '%s': failed to end session: %s", job_id, e)
     try:
         from hermes_state_registry import release_or_close
-        release_or_close(_session_db)
+        release_or_close(_session_db._session_db)
     except (Exception, KeyboardInterrupt) as e:
         logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
 
@@ -2358,7 +2370,7 @@ class _CronAgentSetup:
     """Everything ``AIAgent(...)`` needs that is resolved from job + config (or a preflight block)."""
     blocked: Optional[_RunResult] = None
     model: str = ""
-    runtime: dict = None
+    runtime: dict[str, Any] = field(default_factory=dict)
     prefill_messages: Any = None
     max_iterations: Any = None
     reasoning_config: Any = None
@@ -2499,6 +2511,8 @@ def run_job(
 
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
+    if prompt is None:
+        raise RuntimeError("Cron prompt preparation returned no prompt without an early result")
     logger.info("Prompt: %s", prompt[:100])
 
     agent = None
@@ -2749,13 +2763,16 @@ def run_one_job(
                 if not post_handoff:
                     delivery_error, delivery_outcome = _deliver_crash_failure(
                         job, error, adapters=adapters, loop=loop)
-                mark_job_run(
-                    job["id"],
-                    False,
-                    error,
-                    delivery_error=delivery_error,
-                    **({"expected_fire_owner": owner} if owner else {}),
-                )
+                if owner:
+                    mark_job_run(
+                        job["id"],
+                        False,
+                        error,
+                        delivery_error,
+                        expected_fire_owner=owner,
+                    )
+                else:
+                    mark_job_run(job["id"], False, error, delivery_error)
             finally:
                 finish_execution(
                     execution_id, success=False, error=error,
@@ -3946,7 +3963,8 @@ def _acquire_tick_lock(lock_file):
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+            msvcrt_locking = getattr(msvcrt, "locking")
+            msvcrt_locking(lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)
         return lock_fd
     except OSError as exc:
         if lock_fd is not None:
@@ -3968,11 +3986,12 @@ def _acquire_tick_lock(lock_file):
 
 def _release_tick_lock(lock_fd) -> None:
     if fcntl:
-        with contextlib.suppress((OSError, IOError)):
+        with contextlib.suppress(OSError):
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
     elif msvcrt:
-        with contextlib.suppress((OSError, IOError)):
-            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        with contextlib.suppress(OSError):
+            msvcrt_locking = getattr(msvcrt, "locking")
+            msvcrt_locking(lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
     lock_fd.close()
 
 

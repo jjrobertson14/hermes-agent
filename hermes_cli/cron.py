@@ -137,7 +137,7 @@ def _next_run_row(job: Dict[str, Any]) -> tuple[str, str]:
                                    "is the scheduler running?)", Colors.YELLOW))
 
 
-def _dispatch_display(dispatch: dict) -> Optional[str]:
+def _dispatch_display(dispatch: object) -> Optional[str]:
     """One-line scheduled-vs-actual dispatch summary; None when the stamp is malformed.
 
     On-time dispatches render dim; late/catch-up dispatches render loudly so a run fired long
@@ -800,6 +800,7 @@ def cron_edit(args):
 
 def _job_action(action: str, job_id: str, success_verb: str) -> int:
     _stateless_token = None
+    session_async_delivery = None
     if action == "run":
         # One-shot CLI: a background-dispatched run (daemon thread, triggered when the CLI
         # inherits HERMES_SESSION_KEY) would be orphaned mid-LLM-call, leaving the execution row
@@ -810,13 +811,13 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
             # gateway/desktop session env (HERMES_SESSION_KEY); declare the channel stateless so
             # ``async_delivery_supported()`` gates it off and the run executes synchronously to completion
             # instead. See #86721.
-            from gateway.session_context import _SESSION_ASYNC_DELIVERY
-            _stateless_token = _SESSION_ASYNC_DELIVERY.set(False)
+            from gateway.session_context import _SESSION_ASYNC_DELIVERY as session_async_delivery
+            _stateless_token = session_async_delivery.set(False)
     try:
         result = _cron_api(action=action, job_id=job_id)
     finally:
-        if _stateless_token is not None:
-            _SESSION_ASYNC_DELIVERY.reset(_stateless_token)
+        if _stateless_token is not None and session_async_delivery is not None:
+            session_async_delivery.reset(_stateless_token)
     if not result.get("success"):
         print(color(f"Failed to {action} job: {result.get('error', 'unknown error')}", Colors.RED))
         return 1
@@ -894,7 +895,9 @@ def cron_notepad(args) -> int:
         if key is None or (action == "set" and value is None):
             print(color(f"Usage: hermes cron notepad <job_id> {usage_args}", Colors.RED))
             return 1
+        key = str(key)
         if action == "set":
+            value = str(value)
             notepad.set_note(job_id, key, value)
             print(color(f"Set notepad key '{key}' for job {job_id}.", Colors.GREEN))
             return 0
